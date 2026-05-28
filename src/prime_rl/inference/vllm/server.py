@@ -1,11 +1,13 @@
 import asyncio
+import time
 from argparse import Namespace
+from pathlib import Path
 from typing import Any
 
 import uvloop
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
-from starlette.datastructures import State
+from starlette.datastructures import State, UploadFile
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.openai.api_server import init_app_state
 from vllm.entrypoints.openai.cli_args import make_arg_parser, validate_parsed_serve_args
@@ -43,6 +45,8 @@ logger = init_logger("vllm.entrypoints.openai.api_server")
 
 # Create our own router for custom endpoints
 router = APIRouter()
+WEIGHT_UPDATE_MODES = {"full", "delta"}
+STAGE_READ_CHUNK_BYTES = 16 * 1024 * 1024
 
 
 def engine_client(request: Request) -> EngineClient:
@@ -51,6 +55,55 @@ def engine_client(request: Request) -> EngineClient:
 
 def models(request: Request) -> OpenAIServingModels:
     return request.app.state.openai_serving_models
+
+
+def _ensure_weight_staging_state(state: State) -> None:
+    if not hasattr(state, "staged_versions"):
+        state.staged_versions = {}
+    if not hasattr(state, "active_version"):
+        state.active_version = None
+    if not hasattr(state, "staging_dir"):
+        state.staging_dir = Path("staging")
+    state.staging_dir.mkdir(parents=True, exist_ok=True)
+
+
+def _safe_path_component(value: str) -> str:
+    safe = "".join(char if char.isalnum() or char in "._-" else "_" for char in value)
+    return safe or "unknown"
+
+
+def _error_response(status_code: int, message: str) -> JSONResponse:
+    return JSONResponse({"error": message}, status_code=status_code)
+
+
+async def _read_request_fields(request: Request) -> tuple[dict[str, Any], UploadFile | None]:
+    fields: dict[str, Any] = dict(request.query_params)
+    uploaded_file = None
+    content_type = request.headers.get("content-type", "")
+
+    if content_type.startswith("application/json"):
+        data = await request.json()
+        if isinstance(data, dict):
+            fields.update({key: value for key, value in data.items() if value is not None})
+    elif content_type.startswith(("multipart/form-data", "application/x-www-form-urlencoded")):
+        form = await request.form()
+        for key, value in form.items():
+            if isinstance(value, UploadFile):
+                if key == "file":
+                    uploaded_file = value
+                continue
+            fields[key] = value
+
+    return fields, uploaded_file
+
+
+def _cleanup_staged_file(state: State, entry: dict[str, Any]) -> None:
+    if not entry.get("owned"):
+        return
+    path = Path(entry["path"])
+    staging_dir = Path(state.staging_dir)
+    if path.is_file() and path.parent == staging_dir:
+        path.unlink()
 
 
 WORKER_EXTENSION_CLS = {
@@ -74,7 +127,114 @@ async def resume(request: Request):
 @router.post("/update_weights")
 async def update_weights(request: Request):
     data = await request.json()
-    await engine_client(request).collective_rpc("update_weights_from_path", args=(data.get("weight_dir"),))
+    weight_dir = data.get("weight_dir")
+    mode = data.get("mode", "full")
+    if mode == "full":
+        await engine_client(request).collective_rpc("update_weights_from_path", args=(weight_dir,))
+    elif mode == "delta":
+        await engine_client(request).collective_rpc("update_weights_from_delta_path", args=(weight_dir,))
+    else:
+        return JSONResponse({"error": f"unsupported weight update mode: {mode}"}, status_code=400)
+    return {"status": "ok"}
+
+
+@router.post("/stage")
+async def stage_weights(request: Request):
+    """Stage full or delta weights on the local inference server."""
+    _ensure_weight_staging_state(request.app.state)
+    fields, uploaded_file = await _read_request_fields(request)
+    version = str(fields.get("version", "unknown"))
+    mode = str(fields.get("mode", "full"))
+    base_version = fields.get("base_version")
+    active_version = request.app.state.active_version
+
+    if mode not in WEIGHT_UPDATE_MODES:
+        return _error_response(400, f"unsupported weight update mode: {mode}")
+    if mode == "delta" and base_version and active_version and base_version != active_version:
+        return _error_response(409, f"base_version mismatch: current={active_version}, got={base_version}")
+
+    ingest_start = time.perf_counter()
+    suffix = "delta" if mode == "delta" else "full"
+    if uploaded_file is not None:
+        filename = _safe_path_component(Path(uploaded_file.filename or "weights").name)
+        staged_path = request.app.state.staging_dir / f"{_safe_path_component(version)}_{suffix}_{filename}"
+        with staged_path.open("wb") as f:
+            while chunk := await uploaded_file.read(STAGE_READ_CHUNK_BYTES):
+                f.write(chunk)
+        owned = True
+    else:
+        path = fields.get("path")
+        if path is None:
+            return _error_response(400, "No file uploaded or path provided")
+        staged_path = Path(str(path)).expanduser()
+        if not staged_path.exists():
+            return _error_response(404, f"staged path does not exist: {staged_path}")
+        owned = False
+
+    request.app.state.staged_versions[version] = {"path": staged_path, "mode": mode, "owned": owned}
+    ingest_ms = (time.perf_counter() - ingest_start) * 1000
+    logger.info(
+        "Staged %s weights version %s from %s (base_version=%s active_version=%s owned=%s ingest_ms=%.2f)",
+        mode,
+        version,
+        staged_path.as_posix(),
+        base_version,
+        active_version,
+        owned,
+        ingest_ms,
+    )
+    return {"status": "ok", "version": version, "mode": mode, "path": staged_path.as_posix(), "ingest_ms": ingest_ms}
+
+
+@router.post("/commit")
+async def commit_weights(request: Request):
+    """Commit a staged full checkpoint or sparse delta."""
+    _ensure_weight_staging_state(request.app.state)
+    fields, _ = await _read_request_fields(request)
+    version = fields.get("version")
+    if version is None:
+        return _error_response(400, "version is required")
+    version = str(version)
+
+    staged_versions = request.app.state.staged_versions
+    if version not in staged_versions:
+        return _error_response(404, f"version {version} not found in staging")
+
+    entry = staged_versions[version]
+    mode = entry["mode"]
+    requested_mode = fields.get("mode")
+    if requested_mode is not None and str(requested_mode) != mode:
+        return _error_response(409, f"staged mode mismatch: staged={mode}, requested={requested_mode}")
+
+    path = Path(entry["path"])
+    if mode == "full":
+        await engine_client(request).collective_rpc("update_weights_from_path", args=(path.as_posix(),))
+    elif mode == "delta":
+        await engine_client(request).collective_rpc("update_weights_from_delta_path", args=(path.as_posix(),))
+    else:
+        return _error_response(400, f"unsupported weight update mode: {mode}")
+
+    request.app.state.active_version = version
+    for staged_version, old_entry in list(staged_versions.items()):
+        if staged_version == version:
+            continue
+        _cleanup_staged_file(request.app.state, old_entry)
+        staged_versions.pop(staged_version, None)
+
+    logger.info("Committed %s weights version %s from %s", mode, version, path.as_posix())
+    return {"status": "ok", "active_version": version, "mode": mode}
+
+
+@router.post("/reload_weights")
+async def reload_weights(request: Request):
+    """Reload the base model weights and clear local staging state."""
+    _ensure_weight_staging_state(request.app.state)
+    await engine_client(request).collective_rpc("reload_weights")
+    for entry in list(request.app.state.staged_versions.values()):
+        _cleanup_staged_file(request.app.state, entry)
+    request.app.state.active_version = None
+    request.app.state.staged_versions.clear()
+    logger.info("Reloaded base weights and cleared staged weight versions")
     return {"status": "ok"}
 
 
@@ -135,6 +295,10 @@ async def custom_init_app_state(
 
     state.reset_prefix_cache_after_update = getattr(args, "reset_prefix_cache_after_update", True)
     state.liveness_timeout_seconds = args.liveness_timeout_seconds
+    state.staging_dir = Path(getattr(args, "staging_dir", "staging"))
+    state.staged_versions = {}
+    state.active_version = None
+    state.staging_dir.mkdir(parents=True, exist_ok=True)
 
     # Swap in our ServingTokens subclass for /inference/v1/generate so the
     # X-data-parallel-rank header and routed_experts response field — both

@@ -21,12 +21,16 @@ def make_scheduler() -> Scheduler:
     scheduler.model_name = "test-model"
     scheduler.update_weights_time = 0
     scheduler.wait_for_ckpt_time = 0
+    scheduler.stage_weights_time = 0
+    scheduler.commit_weights_time = 0
     scheduler.inflight_requests = {}
     scheduler.groups = {}
     scheduler.max_off_policy_steps = 1
     scheduler.cancelled_rollouts_count = 0
     scheduler.policy_update_lock = asyncio.Lock()
     scheduler.inflight_policy_update_task = None
+    scheduler.inflight_stage_task = None
+    scheduler.inflight_stage_step = None
     scheduler.update_policy_task = None
     scheduler.rate_limiter = None
     return scheduler
@@ -124,6 +128,154 @@ def test_maybe_update_policy_reuses_inflight_update_after_cancellation():
 
         assert applied_steps == [8]
         assert scheduler.ckpt_step == 8
+
+    asyncio.run(run())
+
+
+def test_policy_update_passes_delta_mode():
+    async def run() -> None:
+        scheduler = make_scheduler()
+        scheduler.config.weight_broadcast = SimpleNamespace(mode="delta")
+        seen: dict[str, object] = {}
+
+        async def update_weights(weight_dir, lora_name=None, step=0, mode="full") -> None:
+            seen["weight_dir"] = weight_dir
+            seen["step"] = step
+            seen["mode"] = mode
+
+        scheduler.student_inference = SimpleNamespace(
+            update_weights=update_weights,
+            update_model_name=MagicMock(),
+        )
+        scheduler.rollout_inference = scheduler.student_inference
+        scheduler._update_off_policy = AsyncMock()
+
+        with patch("prime_rl.orchestrator.scheduler.wait_for_path", new=AsyncMock()):
+            await scheduler._apply_policy_update(8)
+
+        assert seen["step"] == 8
+        assert seen["mode"] == "delta"
+
+    asyncio.run(run())
+
+
+def test_delta_policy_update_advances_one_checkpoint_at_a_time():
+    scheduler = make_scheduler()
+    scheduler.ckpt_step = 7
+    scheduler.step = 20
+    scheduler.config.weight_broadcast = SimpleNamespace(mode="delta")
+
+    with patch("prime_rl.orchestrator.scheduler.get_latest_ckpt_step", return_value=12):
+        assert scheduler._compute_next_ckpt_step() == 8
+
+
+def test_full_policy_update_can_skip_to_latest_checkpoint():
+    scheduler = make_scheduler()
+    scheduler.ckpt_step = 7
+    scheduler.step = 20
+    scheduler.config.weight_broadcast = SimpleNamespace(mode="full")
+
+    with patch("prime_rl.orchestrator.scheduler.get_latest_ckpt_step", return_value=12):
+        assert scheduler._compute_next_ckpt_step() == 19
+
+
+def test_policy_update_can_use_stage_commit_protocol():
+    async def run() -> None:
+        scheduler = make_scheduler()
+        scheduler.config.weight_broadcast = SimpleNamespace(
+            type="filesystem",
+            mode="delta",
+            update_protocol="stage_commit",
+            stage_transport="http_upload",
+        )
+        calls: list[tuple[str, object]] = []
+
+        async def update_weights(*args, **kwargs) -> None:
+            raise AssertionError("direct update_weights should not be used")
+
+        async def stage_weights(weight_path, version, mode="full", base_version=None, upload=False) -> None:
+            calls.append(("stage", weight_path, version, mode, base_version, upload))
+
+        async def commit_weights(version, mode=None) -> None:
+            calls.append(("commit", version, mode))
+
+        scheduler.student_inference = SimpleNamespace(
+            update_weights=update_weights,
+            stage_weights=stage_weights,
+            commit_weights=commit_weights,
+            update_model_name=MagicMock(),
+        )
+        scheduler.rollout_inference = scheduler.student_inference
+        scheduler._update_off_policy = AsyncMock()
+
+        with patch("prime_rl.orchestrator.scheduler.wait_for_path", new=AsyncMock()):
+            await scheduler._apply_policy_update(8)
+
+        assert calls == [
+            ("stage", Path("/tmp/prime-rl-test/broadcasts/step_8"), "8", "delta", "7", True),
+            ("commit", "8", "delta"),
+        ]
+        assert scheduler.ckpt_step == 8
+        assert scheduler.stage_weights_time >= 0
+        assert scheduler.commit_weights_time >= 0
+
+    asyncio.run(run())
+
+
+def test_background_stage_does_not_clear_checkpoint_ready_until_commit():
+    async def run() -> None:
+        scheduler = make_scheduler()
+        scheduler.config.weight_broadcast = SimpleNamespace(
+            type="filesystem",
+            mode="delta",
+            update_protocol="stage_commit",
+            stage_transport="http_upload",
+            background_stage=True,
+        )
+        wait_started = asyncio.Event()
+        release_wait = asyncio.Event()
+        calls: list[tuple[str, object]] = []
+
+        async def wait_for_stable(path) -> None:
+            calls.append(("wait", path))
+            wait_started.set()
+            await release_wait.wait()
+
+        async def stage_weights(weight_path, version, mode="full", base_version=None, upload=False) -> None:
+            calls.append(("stage", weight_path, version, mode, base_version, upload))
+
+        async def commit_weights(version, mode=None) -> None:
+            calls.append(("commit", version, mode))
+
+        scheduler.student_inference = SimpleNamespace(
+            update_weights=AsyncMock(),
+            stage_weights=stage_weights,
+            commit_weights=commit_weights,
+            update_model_name=MagicMock(),
+        )
+        scheduler.rollout_inference = scheduler.student_inference
+        scheduler._update_off_policy = AsyncMock()
+
+        with (
+            patch("prime_rl.orchestrator.scheduler.get_latest_ckpt_step", return_value=8),
+            patch("prime_rl.orchestrator.scheduler.wait_for_path", new=wait_for_stable),
+        ):
+            await scheduler.maybe_update_policy(block=False)
+            await wait_started.wait()
+
+            assert scheduler.checkpoint_ready.is_set()
+            assert calls == [("wait", Path("/tmp/prime-rl-test/broadcasts/step_8/STABLE"))]
+
+            release_wait.set()
+            await scheduler.maybe_update_policy(block=True)
+
+        assert calls == [
+            ("wait", Path("/tmp/prime-rl-test/broadcasts/step_8/STABLE")),
+            ("stage", Path("/tmp/prime-rl-test/broadcasts/step_8"), "8", "delta", "7", True),
+            ("commit", "8", "delta"),
+        ]
+        assert scheduler.ckpt_step == 8
+        assert scheduler.checkpoint_ready.is_set()
 
     asyncio.run(run())
 

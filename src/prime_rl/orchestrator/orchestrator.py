@@ -300,7 +300,10 @@ async def orchestrate(config: OrchestratorConfig):
             config.output_dir, scheduler.ckpt_step, check_exists=check_exists, wait_timeout=wait_timeout
         )
         lora_name = config.student.model.lora.name if config.student.model.lora else None
-        await student_inference.update_weights(weights_path, lora_name=lora_name, step=scheduler.ckpt_step)
+        update_kwargs = {"lora_name": lora_name, "step": scheduler.ckpt_step}
+        if getattr(config.weight_broadcast, "mode", "full") != "full":
+            update_kwargs["mode"] = config.weight_broadcast.mode
+        await student_inference.update_weights(weights_path, **update_kwargs)
         if lora_name is not None:
             student_inference.update_model_name(lora_name)
             if scheduler.rollout_inference is student_inference:

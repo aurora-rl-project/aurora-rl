@@ -522,6 +522,18 @@ FilterConfig: TypeAlias = Annotated[
 class FileSystemWeightBroadcastConfig(BaseConfig):
     type: Literal["filesystem"] = "filesystem"
 
+    mode: Literal["full", "delta"] = "full"
+    """Weight payload mode expected from trainer broadcasts."""
+
+    update_protocol: Literal["direct", "stage_commit"] = "direct"
+    """Inference update protocol. ``direct`` calls /update_weights; ``stage_commit`` calls /stage then /commit."""
+
+    stage_transport: Literal["shared_fs", "http_upload"] = "shared_fs"
+    """How ``stage_commit`` sends staged weights to inference."""
+
+    background_stage: bool = False
+    """When using ``stage_commit``, wait for STABLE and call /stage in the background before commit."""
+
 
 class NCCLWeightBroadcastConfig(BaseConfig):
     type: Literal["nccl"] = "nccl"

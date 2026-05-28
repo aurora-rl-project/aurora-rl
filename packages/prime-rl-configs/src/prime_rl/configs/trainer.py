@@ -458,11 +458,17 @@ class BaseWeightBroadcastConfig(BaseConfig):
 class FileSystemWeightBroadcastConfig(BaseWeightBroadcastConfig):
     type: Literal["filesystem"] = "filesystem"
 
+    mode: Literal["full", "delta"] = "full"
+    """Weight payload mode. ``full`` writes full HF-compatible checkpoints; ``delta`` writes step 0 full weights followed by sparse deltas."""
+
     save_sharded: bool = True
     """Save the weight checkpoint in sharded format."""
 
     save_format: Literal["safetensors", "torch"] = "safetensors"
     """Weight checkpoint serialization format."""
+
+    delta_index_encoding: Literal["optimized", "naive"] = "optimized"
+    """Sparse delta index encoding used when ``mode='delta'``."""
 
 
 class NCCLWeightBroadcastConfig(BaseWeightBroadcastConfig):

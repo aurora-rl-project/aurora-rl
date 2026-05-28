@@ -22,6 +22,9 @@ class ServerConfig(BaseConfig):
     liveness_timeout_seconds: float = Field(30.0, gt=0)
     """Timeout in seconds for the ``/liveness`` endpoint's internal vLLM worker RPC. With Kubernetes liveness probes, keep the probe ``timeoutSeconds`` at least this high."""
 
+    staging_dir: Path = Path("staging")
+    """Directory used by the inference server's ``/stage`` endpoint for uploaded weight files."""
+
 
 class ParallelConfig(BaseConfig):
     tp: int = 1
@@ -375,6 +378,7 @@ class InferenceConfig(BaseConfig):
             "server.host": "host",
             "server.port": "port",
             "server.liveness_timeout_seconds": "liveness_timeout_seconds",
+            "server.staging_dir": "staging_dir",
             "model.name": "model",
             "model.dtype": "dtype",
             "model.max_model_len": "max_model_len",

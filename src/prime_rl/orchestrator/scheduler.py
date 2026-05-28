@@ -45,6 +45,14 @@ class GroupState:
     failed_rollouts: int = 0
 
 
+@dataclass
+class StagedPolicy:
+    step: int
+    mode: str
+    wait_for_ckpt_time: float
+    stage_time: float
+
+
 class Scheduler:
     """
     Asynchronously manages scheduling of rollout requests and policy updates.
@@ -112,8 +120,11 @@ class Scheduler:
         self.checkpoint_ready = asyncio.Event()
         self.checkpoint_ready.set()
         self.update_weights_time, self.wait_for_ckpt_time = 0, 0
+        self.stage_weights_time, self.commit_weights_time = 0, 0
         self.update_policy_task: asyncio.Task | None = None
         self.inflight_policy_update_task: asyncio.Task | None = None
+        self.inflight_stage_task: asyncio.Task | None = None
+        self.inflight_stage_step: int | None = None
         self.policy_update_lock = asyncio.Lock()
         self.cancelled_rollouts_count = 0
         self.empty_rollouts_by_env: dict[str, int] = defaultdict(int)
@@ -279,7 +290,7 @@ class Scheduler:
     async def update_policy_loop(self):
         """Continuously checks for new policy checkpoints."""
         while True:
-            await self.maybe_update_policy()
+            await self.maybe_update_policy(block=False)
             await asyncio.sleep(1)
 
     def _compute_next_ckpt_step(self) -> int:
@@ -288,7 +299,37 @@ class Scheduler:
         # broadcast (so a fast trainer briefly running on-policy is fine). ``latest_ckpt_step``
         # is non-negative so it also clamps a self.step == 0 startup.
         latest_ckpt_step = get_latest_ckpt_step(get_broadcast_dir(self.config.output_dir)) or 0
-        return max(self.step - 1, latest_ckpt_step)
+        target_step = max(self.step - 1, latest_ckpt_step)
+        if self._weight_update_mode() == "delta":
+            target_step = min(target_step, self.ckpt_step + 1)
+        return target_step
+
+    def _weight_broadcast_config(self):
+        return getattr(self.config, "weight_broadcast", None)
+
+    def _weight_update_mode(self) -> str:
+        return getattr(self._weight_broadcast_config(), "mode", "full")
+
+    def _weight_update_protocol(self) -> str:
+        return getattr(self._weight_broadcast_config(), "update_protocol", "direct")
+
+    def _weight_stage_transport(self) -> str:
+        return getattr(self._weight_broadcast_config(), "stage_transport", "shared_fs")
+
+    def _uses_background_stage(self) -> bool:
+        return self._weight_update_protocol() == "stage_commit" and bool(
+            getattr(self._weight_broadcast_config(), "background_stage", False)
+        )
+
+    def _uses_stage_upload(self) -> bool:
+        transport = self._weight_stage_transport()
+        if transport == "shared_fs":
+            return False
+        if transport == "http_upload":
+            if self._weight_update_mode() != "delta":
+                raise ValueError("filesystem http_upload stage transport currently supports delta mode only")
+            return True
+        raise ValueError(f"unsupported filesystem stage transport: {transport}")
 
     async def _apply_policy_update(self, next_ckpt_step: int) -> None:
         # If we're advancing to step - 1, the trainer hasn't broadcast it yet (otherwise
@@ -310,9 +351,9 @@ class Scheduler:
             f"Got new policy with step {next_ckpt_step}. Updating weights and cancelling old rollout requests."
         )
 
-        update_weights_start_time = time.perf_counter()
         weights_path = get_step_path(get_broadcast_dir(self.config.output_dir), next_ckpt_step)
-        await self.student_inference.update_weights(weights_path, lora_name=self.lora_name, step=next_ckpt_step)
+        update_weights_start_time = time.perf_counter()
+        await self._update_inference_weights(weights_path, next_ckpt_step)
         self.update_weights_time = time.perf_counter() - update_weights_start_time
         self.logger.debug(f"Updated weights to step {next_ckpt_step} in {self.update_weights_time:.2f}s")
 
@@ -325,6 +366,120 @@ class Scheduler:
             if self.rollout_inference is self.student_inference:
                 self.model_name = self.lora_name
 
+        self.checkpoint_ready.set()
+        await self._update_off_policy()
+
+    async def _update_inference_weights(self, weights_path, next_ckpt_step: int) -> None:
+        mode = self._weight_update_mode()
+        update_protocol = self._weight_update_protocol()
+        if update_protocol == "stage_commit":
+            if self.lora_name is not None:
+                raise ValueError("filesystem stage_commit update protocol does not support LoRA updates")
+
+            version = str(next_ckpt_step)
+            base_version = str(next_ckpt_step - 1) if mode == "delta" else None
+            stage_start_time = time.perf_counter()
+            await self.student_inference.stage_weights(
+                weights_path,
+                version=version,
+                mode=mode,
+                base_version=base_version,
+                upload=self._uses_stage_upload(),
+            )
+            self.stage_weights_time = time.perf_counter() - stage_start_time
+
+            commit_start_time = time.perf_counter()
+            await self.student_inference.commit_weights(version=version, mode=mode)
+            self.commit_weights_time = time.perf_counter() - commit_start_time
+            self.logger.debug(
+                f"Staged weights for step {next_ckpt_step} in {self.stage_weights_time:.2f}s; "
+                f"committed in {self.commit_weights_time:.2f}s"
+            )
+            return
+
+        self.stage_weights_time = 0
+        self.commit_weights_time = 0
+        update_kwargs = {"lora_name": self.lora_name, "step": next_ckpt_step}
+        if mode != "full":
+            update_kwargs["mode"] = mode
+        await self.student_inference.update_weights(weights_path, **update_kwargs)
+
+    async def _stage_policy_update(self, next_ckpt_step: int) -> StagedPolicy:
+        if self.lora_name is not None:
+            raise ValueError("filesystem background stage protocol does not support LoRA updates")
+
+        mode = self._weight_update_mode()
+        version = str(next_ckpt_step)
+        base_version = str(next_ckpt_step - 1) if mode == "delta" else None
+        weights_path = get_step_path(get_broadcast_dir(self.config.output_dir), next_ckpt_step)
+        stable_path = weights_path / "STABLE"
+
+        self.logger.info(f"Background staging waiting for checkpoint {next_ckpt_step}")
+        wait_for_ckpt_start_time = time.perf_counter()
+        await wait_for_path(stable_path)
+        wait_for_ckpt_time = time.perf_counter() - wait_for_ckpt_start_time
+
+        stage_start_time = time.perf_counter()
+        await self.student_inference.stage_weights(
+            weights_path,
+            version=version,
+            mode=mode,
+            base_version=base_version,
+            upload=self._uses_stage_upload(),
+        )
+        stage_time = time.perf_counter() - stage_start_time
+        self.logger.debug(
+            f"Background staged weights for step {next_ckpt_step} in {stage_time:.2f}s "
+            f"after waiting {wait_for_ckpt_time:.2f}s"
+        )
+        return StagedPolicy(
+            step=next_ckpt_step,
+            mode=mode,
+            wait_for_ckpt_time=wait_for_ckpt_time,
+            stage_time=stage_time,
+        )
+
+    async def _get_or_start_stage_task(self, next_ckpt_step: int) -> asyncio.Task:
+        if self.inflight_stage_task is not None:
+            if self.inflight_stage_task.done() and self.inflight_stage_step != next_ckpt_step:
+                self.inflight_stage_task = None
+                self.inflight_stage_step = None
+            elif self.inflight_stage_step == next_ckpt_step:
+                return self.inflight_stage_task
+            elif not self.inflight_stage_task.done():
+                return self.inflight_stage_task
+
+        self.inflight_stage_step = next_ckpt_step
+        self.inflight_stage_task = asyncio.create_task(self._stage_policy_update(next_ckpt_step))
+        self.logger.debug(f"Queued background stage for step {next_ckpt_step}")
+        return self.inflight_stage_task
+
+    async def _commit_staged_policy_update(self, stage_task: asyncio.Task) -> None:
+        if not stage_task.done():
+            self.logger.info("Orchestrator paused: waiting for background stage to finish")
+        self.checkpoint_ready.clear()
+        update_weights_start_time = time.perf_counter()
+        staged_policy = await stage_task
+
+        commit_start_time = time.perf_counter()
+        await self.student_inference.commit_weights(version=str(staged_policy.step), mode=staged_policy.mode)
+        self.commit_weights_time = time.perf_counter() - commit_start_time
+        self.wait_for_ckpt_time = staged_policy.wait_for_ckpt_time
+        self.stage_weights_time = staged_policy.stage_time
+        self.update_weights_time = time.perf_counter() - update_weights_start_time
+        self.logger.debug(
+            f"Committed background-staged weights for step {staged_policy.step} in "
+            f"{self.commit_weights_time:.2f}s"
+        )
+
+        self.ckpt_step = staged_policy.step
+        if self.lora_name is not None:
+            self.student_inference.update_model_name(self.lora_name)
+            if self.rollout_inference is self.student_inference:
+                self.model_name = self.lora_name
+
+        self.inflight_stage_task = None
+        self.inflight_stage_step = None
         self.checkpoint_ready.set()
         await self._update_off_policy()
 
@@ -344,12 +499,19 @@ class Scheduler:
             task.add_done_callback(_clear_inflight_policy_update)
             return task
 
-    async def maybe_update_policy(self):
+    async def maybe_update_policy(self, *, block: bool = True):
         """Updates the policy to the latest available checkpoint. Aborts rollout requests that are older than the max retention steps."""
         while True:
             next_ckpt_step = self._compute_next_ckpt_step()
             if next_ckpt_step <= self.ckpt_step:
                 return
+
+            if self._uses_background_stage():
+                stage_task = await self._get_or_start_stage_task(next_ckpt_step)
+                if not block:
+                    return
+                await self._commit_staged_policy_update(stage_task)
+                continue
 
             task = await self._get_or_start_policy_update_task(next_ckpt_step)
             await asyncio.shield(task)
@@ -530,6 +692,10 @@ class Scheduler:
         if self.inflight_policy_update_task is not None:
             await safe_cancel(self.inflight_policy_update_task)
             self.inflight_policy_update_task = None
+        if self.inflight_stage_task is not None:
+            await safe_cancel(self.inflight_stage_task)
+            self.inflight_stage_task = None
+            self.inflight_stage_step = None
 
     @property
     def max_off_policy_level(self) -> int:
@@ -554,6 +720,8 @@ class Scheduler:
         metrics = {
             "time/wait_for_ckpt": self.wait_for_ckpt_time,
             "time/update_weights": self.update_weights_time,
+            "time/stage_weights": self.stage_weights_time,
+            "time/commit_weights": self.commit_weights_time,
             "scheduler/async_level": self.async_level,
             "scheduler/inflight_rollouts": self.inflight_rollout_count,
             "scheduler/inflight_samples": self.inflight_sample_count,

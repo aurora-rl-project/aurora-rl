@@ -224,6 +224,31 @@ def test_shared_model_name_propagates_to_subconfigs():
     assert config.orchestrator.tokenizer.name == model_name
 
 
+def test_shared_filesystem_delta_weight_broadcast_mode_propagates():
+    config = RLConfig.model_validate(
+        {
+            "weight_broadcast": {
+                "type": "filesystem",
+                "mode": "delta",
+                "update_protocol": "stage_commit",
+                "stage_transport": "http_upload",
+                "background_stage": True,
+            },
+            "trainer": {},
+            "orchestrator": {"renderer": None},
+            "inference": {},
+        }
+    )
+
+    assert config.trainer.weight_broadcast.type == "filesystem"
+    assert config.trainer.weight_broadcast.mode == "delta"
+    assert config.orchestrator.weight_broadcast.type == "filesystem"
+    assert config.orchestrator.weight_broadcast.mode == "delta"
+    assert config.orchestrator.weight_broadcast.update_protocol == "stage_commit"
+    assert config.orchestrator.weight_broadcast.stage_transport == "http_upload"
+    assert config.orchestrator.weight_broadcast.background_stage is True
+
+
 def test_shared_tokenizer_propagates_when_subconfigs_unset():
     config = RLConfig.model_validate(
         {

@@ -48,8 +48,25 @@ class InferencePool(Protocol):
         """Wait for inference pool to be ready."""
         ...
 
-    async def update_weights(self, weight_dir: Path | None, lora_name: str | None = None, step: int = 0) -> None:
+    async def update_weights(
+        self, weight_dir: Path | None, lora_name: str | None = None, step: int = 0, mode: str = "full"
+    ) -> None:
         """Update weights on all inference servers."""
+        ...
+
+    async def stage_weights(
+        self,
+        weight_path: Path,
+        version: str,
+        mode: str = "full",
+        base_version: str | None = None,
+        upload: bool = False,
+    ) -> None:
+        """Stage weights on all inference servers."""
+        ...
+
+    async def commit_weights(self, version: str, mode: str | None = None) -> None:
+        """Commit staged weights on all inference servers."""
         ...
 
     def get_metrics(self) -> dict[str, float]:
@@ -112,8 +129,33 @@ class StaticInferencePool:
         )
         await maybe_check_has_model(self._admin_clients, model_name, skip_model_check=self._skip_model_check)
 
-    async def update_weights(self, weight_dir: Path | None, lora_name: str | None = None, step: int = 0) -> None:
-        await update_weights(self._admin_clients, weight_dir, lora_name=lora_name, step=step)
+    async def update_weights(
+        self, weight_dir: Path | None, lora_name: str | None = None, step: int = 0, mode: str = "full"
+    ) -> None:
+        await update_weights(self._admin_clients, weight_dir, lora_name=lora_name, step=step, mode=mode)
+
+    async def stage_weights(
+        self,
+        weight_path: Path,
+        version: str,
+        mode: str = "full",
+        base_version: str | None = None,
+        upload: bool = False,
+    ) -> None:
+        await stage_weights(
+            self._admin_clients,
+            weight_path,
+            version=version,
+            mode=mode,
+            base_version=base_version,
+            upload=upload,
+        )
+
+    async def commit_weights(self, version: str, mode: str | None = None) -> None:
+        await commit_weights(self._admin_clients, version=version, mode=mode)
+
+    async def reload_weights(self) -> None:
+        await reload_weights(self._admin_clients)
 
     def get_metrics(self) -> dict[str, float]:
         return {}
@@ -308,6 +350,7 @@ async def update_weights(
     weight_dir: Path | None,
     lora_name: str | None = None,
     step: int = 0,
+    mode: str = "full",
 ) -> None:
     """Update weights on static inference servers.
 
@@ -327,7 +370,7 @@ async def update_weights(
     else:
 
         async def _update_weights(admin_client: AsyncClient, weight_dir: str | None) -> None:
-            response = await admin_client.post("/update_weights", json={"weight_dir": weight_dir})
+            response = await admin_client.post("/update_weights", json={"weight_dir": weight_dir, "mode": mode})
             response.raise_for_status()
 
         # Pause engines so all DP workers drain in-flight work and can join the NCCL broadcast
@@ -344,6 +387,80 @@ async def update_weights(
             await asyncio.gather(*[_update_weights(admin_client, weight_dir_posix) for admin_client in admin_clients])
         finally:
             await _resume_engines(admin_clients)
+
+
+async def stage_weights(
+    admin_clients: list[AsyncClient],
+    weight_path: Path,
+    version: str,
+    mode: str = "full",
+    base_version: str | None = None,
+    upload: bool = False,
+) -> None:
+    """Stage weights on static inference servers.
+
+    By default this records a path that is already visible to the inference
+    server, matching the shared-filesystem delta path used by local migration
+    runs. Set ``upload=True`` to stream a single file to the server's staging
+    directory.
+    """
+    if mode not in {"full", "delta"}:
+        raise ValueError(f"unsupported weight update mode: {mode}")
+
+    data = {"version": version, "mode": mode}
+    if base_version is not None:
+        data["base_version"] = base_version
+
+    async def _stage_path(admin_client: AsyncClient) -> None:
+        response = await admin_client.post("/stage", data={**data, "path": weight_path.as_posix()})
+        response.raise_for_status()
+
+    async def _stage_upload(admin_client: AsyncClient) -> None:
+        upload_path = weight_path
+        if upload_path.is_dir():
+            if mode != "delta":
+                raise ValueError("upload=True requires a file path for full checkpoint staging")
+            upload_path = upload_path / "delta.safetensors"
+        with upload_path.open("rb") as f:
+            files = {"file": (upload_path.name, f, "application/octet-stream")}
+            response = await admin_client.post("/stage", data=data, files=files)
+        response.raise_for_status()
+
+    if upload:
+        await asyncio.gather(*[_stage_upload(admin_client) for admin_client in admin_clients])
+    else:
+        await asyncio.gather(*[_stage_path(admin_client) for admin_client in admin_clients])
+
+
+async def commit_weights(admin_clients: list[AsyncClient], version: str, mode: str | None = None) -> None:
+    """Commit a staged weight version on static inference servers."""
+    data = {"version": version}
+    if mode is not None:
+        data["mode"] = mode
+
+    async def _commit(admin_client: AsyncClient) -> None:
+        response = await admin_client.post("/commit", data=data)
+        response.raise_for_status()
+
+    await _pause_engines(admin_clients)
+    try:
+        await asyncio.gather(*[_commit(admin_client) for admin_client in admin_clients])
+    finally:
+        await _resume_engines(admin_clients)
+
+
+async def reload_weights(admin_clients: list[AsyncClient]) -> None:
+    """Reload base model weights on static inference servers."""
+
+    async def _reload(admin_client: AsyncClient) -> None:
+        response = await admin_client.post("/reload_weights")
+        response.raise_for_status()
+
+    await _pause_engines(admin_clients)
+    try:
+        await asyncio.gather(*[_reload(admin_client) for admin_client in admin_clients])
+    finally:
+        await _resume_engines(admin_clients)
 
 
 def _is_retryable_lora_error(exception: BaseException) -> bool:

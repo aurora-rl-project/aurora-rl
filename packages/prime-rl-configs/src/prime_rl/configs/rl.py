@@ -115,6 +115,18 @@ class SharedWeightBroadcastConfig(BaseConfig):
     type: Literal["nccl", "filesystem"] = "filesystem"
     """Weight broadcast transport."""
 
+    mode: Literal["full", "delta"] = "full"
+    """Filesystem weight payload mode. Ignored for NCCL."""
+
+    update_protocol: Literal["direct", "stage_commit"] = "direct"
+    """Filesystem inference update protocol. Ignored for NCCL."""
+
+    stage_transport: Literal["shared_fs", "http_upload"] = "shared_fs"
+    """Filesystem stage transport. Ignored unless ``update_protocol = "stage_commit"``."""
+
+    background_stage: bool = False
+    """When using filesystem stage_commit, stage new versions in the background before commit."""
+
     port: int = 29501
     """Port for NCCL weight broadcast."""
 
@@ -320,8 +332,13 @@ class RLConfig(BaseConfig):
                     quantize_in_weight_transfer=self.weight_broadcast.quantize_in_weight_transfer,
                 )
             elif self.weight_broadcast.type == "filesystem":
-                self.trainer.weight_broadcast = TrainerFileSystemWeightBroadcastConfig()
-                self.orchestrator.weight_broadcast = OrchestratorFileSystemWeightBroadcastConfig()
+                self.trainer.weight_broadcast = TrainerFileSystemWeightBroadcastConfig(mode=self.weight_broadcast.mode)
+                self.orchestrator.weight_broadcast = OrchestratorFileSystemWeightBroadcastConfig(
+                    mode=self.weight_broadcast.mode,
+                    update_protocol=self.weight_broadcast.update_protocol,
+                    stage_transport=self.weight_broadcast.stage_transport,
+                    background_stage=self.weight_broadcast.background_stage,
+                )
             if self.inference is not None:
                 self.inference.weight_broadcast = InferenceWeightBroadcastConfig(type=self.weight_broadcast.type)
 

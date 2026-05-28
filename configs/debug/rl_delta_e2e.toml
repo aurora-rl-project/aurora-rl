@@ -1,0 +1,55 @@
+output_dir = "outputs/debug-rl-delta-e2e"
+clean_output_dir = true
+max_steps = 4
+seq_len = 1024
+
+[deployment]
+num_train_gpus = 1
+num_infer_gpus = 1
+gpus_per_node = 4
+
+[weight_broadcast]
+type = "filesystem"
+mode = "delta"
+update_protocol = "stage_commit"
+stage_transport = "http_upload"
+background_stage = true
+
+[model]
+name = "Qwen/Qwen3-0.6B"
+
+[trainer.model]
+impl = "hf"
+
+[trainer.optim]
+lr = 1e-5
+
+[orchestrator]
+batch_size = 1
+group_size = 1
+max_inflight_rollouts = 1
+
+[orchestrator.advantage]
+type = "custom"
+import_path = "prime_rl.orchestrator.debug_advantages.constant_advantage"
+kwargs = { value = 1.0 }
+
+[orchestrator.train.sampling]
+max_completion_tokens = 16
+
+[[orchestrator.train.env]]
+id = "alphabet-sort"
+name = "alphabet-sort"
+args = { min_turns = 1, max_turns = 1, min_names_per_turn = 1, max_names_per_turn = 2, similarity_power = 2, power_per_turn = false }
+
+[orchestrator.renderer]
+name = "default"
+
+[inference]
+gpu_memory_utilization = 0.45
+
+[inference.server]
+staging_dir = "/tmp/prime-rl-delta-e2e/staging"
+
+[inference.model]
+enforce_eager = true

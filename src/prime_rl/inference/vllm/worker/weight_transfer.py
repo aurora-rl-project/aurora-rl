@@ -1,10 +1,14 @@
+import time
 from typing import Generator, Iterable
 
 import torch
+from safetensors import safe_open
 from torch.nn import Module
 from vllm.config import set_current_vllm_config
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.reload import finalize_layerwise_reload, initialize_layerwise_reload
+
+from prime_rl.utils.delta import DELTA_INDEX_SUFFIX, DELTA_VALUE_SUFFIX, decode_sparse_indices
 
 logger = init_logger("vllm.inference.vllm.worker_weight_transfer")
 
@@ -21,6 +25,71 @@ def load_weights_checkpoint_layerwise(
         initialize_layerwise_reload(model)
         model.load_weights(state_iter)  # type: ignore
         finalize_layerwise_reload(model, model_config)
+
+
+@torch.no_grad()
+def load_sparse_delta_weights(model: Module, delta_path: str, scale_factor: float = 1.0) -> None:
+    """Apply a sparse delta safetensors file to the current model weights in-place."""
+    params = dict(model.named_parameters())
+    start_time = time.perf_counter()
+    updated = 0
+    delta_values = 0
+    full_tensor_updates = 0
+
+    with safe_open(delta_path, framework="pt", device="cpu") as delta:
+        delta_keys = set(delta.keys())
+        idx_names = {key[: -len(DELTA_INDEX_SUFFIX)] for key in delta_keys if key.endswith(DELTA_INDEX_SUFFIX)}
+        val_names = {key[: -len(DELTA_VALUE_SUFFIX)] for key in delta_keys if key.endswith(DELTA_VALUE_SUFFIX)}
+
+        if not idx_names and not val_names:
+            raise ValueError(f"{delta_path} does not look like a sparse delta file")
+        if idx_names != val_names:
+            raise ValueError(
+                f"delta index/value names mismatch: idx-only={idx_names - val_names}, val-only={val_names - idx_names}"
+            )
+
+        missing = sorted(idx_names - set(params))
+        if missing:
+            raise ValueError(f"delta contains {len(missing)} parameter(s) not present in the vLLM model: {missing[:10]}")
+
+        logger.info(f"Applying sparse delta from {delta_path} ({len(idx_names)} tensors)")
+        for name in sorted(idx_names):
+            param = params[name]
+            flat = param.data.reshape(-1)
+            values_cpu = delta.get_tensor(f"{name}{DELTA_VALUE_SUFFIX}").reshape(-1)
+            indices = decode_sparse_indices(delta.get_tensor(f"{name}{DELTA_INDEX_SUFFIX}"), values_cpu.numel())
+            if indices.numel() == 0:
+                continue
+
+            if int(indices[0].item()) < 0 or int(indices[-1].item()) >= flat.numel():
+                raise ValueError(f"sparse delta index out of range for {name}")
+
+            values = values_cpu.to(device=flat.device, dtype=flat.dtype)
+            if scale_factor != 1.0:
+                values = values * scale_factor
+
+            if _indices_cover_flat_tensor(indices, flat.numel()):
+                flat.add_(values)
+                full_tensor_updates += 1
+            else:
+                flat.index_add_(0, indices.to(device=flat.device), values)
+
+            updated += 1
+            delta_values += values_cpu.numel()
+
+    logger.info(
+        f"Applied sparse delta to {updated} tensors ({delta_values} values, "
+        f"{full_tensor_updates} full-tensor updates) in {time.perf_counter() - start_time:.2f}s"
+    )
+
+
+def _indices_cover_flat_tensor(indices: torch.Tensor, flat_numel: int) -> bool:
+    return (
+        indices.numel() == flat_numel
+        and flat_numel > 0
+        and int(indices[0].item()) == 0
+        and int(indices[-1].item()) == flat_numel - 1
+    )
 
 
 def _invert_logical_to_physical_map(logical_to_physical_map: torch.Tensor, num_physical_experts: int) -> torch.Tensor:
