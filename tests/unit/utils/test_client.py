@@ -6,7 +6,15 @@ import httpx
 import verifiers as vf
 
 from prime_rl.configs.shared import ClientConfig
-from prime_rl.utils.client import _is_retryable_lora_error, load_lora_adapter, setup_clients
+from prime_rl.utils.client import (
+    EndpointOperationError,
+    EndpointOperationResult,
+    StaticInferencePool,
+    _is_retryable_lora_error,
+    load_lora_adapter,
+    setup_clients,
+    stage_weights,
+)
 
 
 def test_is_retryable_lora_error_returns_true_for_404():
@@ -117,3 +125,86 @@ def test_setup_clients_preserves_chat_client_defaults():
             extra_headers_from_state={},
         )
     ]
+
+
+def test_setup_clients_expands_multiple_base_urls_and_dp_ranks():
+    client_config = ClientConfig(
+        base_url=["http://worker-a:8000/v1", "http://worker-b:8000/v1"],
+        api_key_var="PRIME_API_KEY",
+        dp_rank_count=2,
+    )
+
+    clients = setup_clients(client_config)
+
+    assert [client.client_idx for client in clients] == [0, 1, 2, 3]
+    assert [client.api_base_url for client in clients] == [
+        "http://worker-a:8000/v1",
+        "http://worker-a:8000/v1",
+        "http://worker-b:8000/v1",
+        "http://worker-b:8000/v1",
+    ]
+    assert [client.extra_headers["X-data-parallel-rank"] for client in clients] == ["0", "1", "0", "1"]
+
+
+def test_stage_weights_reports_partial_endpoint_failure(tmp_path):
+    delta_dir = tmp_path / "step_1"
+    delta_dir.mkdir()
+
+    async def run() -> None:
+        async def ok_handler(request: httpx.Request) -> httpx.Response:
+            assert request.url.path == "/stage"
+            return httpx.Response(200, json={"status": "ok"})
+
+        async def fail_handler(request: httpx.Request) -> httpx.Response:
+            assert request.url.path == "/stage"
+            return httpx.Response(500, json={"error": "failed"})
+
+        async with (
+            httpx.AsyncClient(transport=httpx.MockTransport(ok_handler), base_url="http://worker-a") as ok_client,
+            httpx.AsyncClient(transport=httpx.MockTransport(fail_handler), base_url="http://worker-b") as fail_client,
+        ):
+            await stage_weights([ok_client, fail_client], delta_dir, version="1", mode="delta")
+
+    operation = None
+    try:
+        asyncio.run(run())
+    except EndpointOperationError as exc:
+        operation = exc.operation
+        results = exc.results
+    else:
+        raise AssertionError("stage_weights should fail when one endpoint fails")
+
+    assert operation == "stage_weights"
+    assert [(result.endpoint, result.ok) for result in results] == [
+        ("http://worker-a", True),
+        ("http://worker-b", False),
+    ]
+    assert "HTTPStatusError" in (results[1].error or "")
+
+
+def test_static_inference_pool_records_endpoint_metrics():
+    pool = StaticInferencePool.__new__(StaticInferencePool)
+    pool._admin_clients = [
+        httpx.AsyncClient(base_url="http://worker-a"),
+        httpx.AsyncClient(base_url="http://worker-b"),
+    ]
+    pool._endpoint_stats = {str(client.base_url): {} for client in pool._admin_clients}
+
+    pool._record_endpoint_results(
+        [
+            EndpointOperationResult("http://worker-a", "stage_weights", 0.25),
+            EndpointOperationResult("http://worker-b", "stage_weights", 0.5, error="boom"),
+            EndpointOperationResult("http://worker-a", "commit_weights", 0.1),
+        ]
+    )
+
+    metrics = pool.get_metrics()
+    assert metrics["inference_endpoint/0/stage_weights/requests"] == 1.0
+    assert metrics["inference_endpoint/0/stage_weights/errors"] == 0.0
+    assert metrics["inference_endpoint/0/stage_weights/last_duration_s"] == 0.25
+    assert metrics["inference_endpoint/1/stage_weights/requests"] == 1.0
+    assert metrics["inference_endpoint/1/stage_weights/errors"] == 1.0
+    assert metrics["inference_endpoint/0/commit_weights/requests"] == 1.0
+
+    asyncio.run(pool._admin_clients[0].aclose())
+    asyncio.run(pool._admin_clients[1].aclose())

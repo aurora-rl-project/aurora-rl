@@ -129,7 +129,7 @@ def test_client_stage_chunk_uploads_delta_file(tmp_path) -> None:
 
     async def run() -> None:
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
-            await stage_weights(
+            return await stage_weights(
                 [client],
                 delta_dir,
                 version="1",
@@ -140,15 +140,55 @@ def test_client_stage_chunk_uploads_delta_file(tmp_path) -> None:
                 chunk_size_bytes=5,
             )
 
-    asyncio.run(run())
+    results = asyncio.run(run())
 
     staged = app.state.staged_versions["1"]
     staged_path = staged["path"]
+    assert [result.endpoint for result in results] == ["http://test"]
+    assert [result.operation for result in results] == ["stage_weights"]
+    assert all(result.ok for result in results)
     assert app.state.stage_uploads == {}
     assert staged["owned"] is True
     assert staged["mode"] == "delta"
     assert staged_path.parent == app.state.staging_dir
     assert staged_path.read_bytes() == b"chunked-delta-upload"
+
+
+def test_client_stage_chunk_uploads_delta_file_to_multiple_endpoints(tmp_path) -> None:
+    delta_dir = tmp_path / "step_1"
+    delta_dir.mkdir()
+    delta_file = delta_dir / "delta.safetensors"
+    delta_file.write_bytes(b"multi-endpoint-delta")
+    app_dirs = [tmp_path / "a", tmp_path / "b"]
+    for app_dir in app_dirs:
+        app_dir.mkdir()
+    apps = [make_app(app_dir) for app_dir in app_dirs]
+
+    async def run() -> None:
+        clients = [
+            httpx.AsyncClient(transport=httpx.ASGITransport(app=apps[0]), base_url="http://worker-a"),
+            httpx.AsyncClient(transport=httpx.ASGITransport(app=apps[1]), base_url="http://worker-b"),
+        ]
+        async with clients[0], clients[1]:
+            return await stage_weights(
+                clients,
+                delta_dir,
+                version="1",
+                mode="delta",
+                base_version="0",
+                upload=True,
+                upload_method="chunked",
+                chunk_size_bytes=4,
+            )
+
+    results = asyncio.run(run())
+
+    assert sorted(result.endpoint for result in results) == ["http://worker-a", "http://worker-b"]
+    assert all(result.ok for result in results)
+    for app in apps:
+        staged = app.state.staged_versions["1"]
+        assert staged["owned"] is True
+        assert staged["path"].read_bytes() == b"multi-endpoint-delta"
 
 
 def test_stage_chunk_finalize_accepts_out_of_order_chunks(tmp_path) -> None:

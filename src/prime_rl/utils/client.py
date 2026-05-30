@@ -3,9 +3,11 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
+import time
+from dataclasses import dataclass
 from itertools import cycle
 from pathlib import Path
-from typing import Literal, Protocol, runtime_checkable
+from typing import Awaitable, Callable, Literal, Protocol, runtime_checkable
 
 import httpx
 import verifiers as vf
@@ -18,6 +20,42 @@ from prime_rl.configs.shared import ClientConfig
 from prime_rl.utils.logger import get_logger
 
 STAGE_UPLOAD_CHUNK_BYTES = 16 * 1024 * 1024
+
+
+@dataclass(frozen=True)
+class EndpointOperationResult:
+    endpoint: str
+    operation: str
+    duration_s: float
+    error: str | None = None
+
+    @property
+    def ok(self) -> bool:
+        return self.error is None
+
+
+class EndpointOperationError(RuntimeError):
+    def __init__(self, operation: str, results: list[EndpointOperationResult]):
+        self.operation = operation
+        self.results = results
+        failures = [result for result in results if not result.ok]
+        message = "; ".join(f"{failure.endpoint}: {failure.error}" for failure in failures)
+        super().__init__(f"{operation} failed on {len(failures)}/{len(results)} inference endpoint(s): {message}")
+
+
+@dataclass
+class EndpointStats:
+    requests: int = 0
+    errors: int = 0
+    total_duration_s: float = 0.0
+    last_duration_s: float = 0.0
+
+    def record(self, result: EndpointOperationResult) -> None:
+        self.requests += 1
+        if not result.ok:
+            self.errors += 1
+        self.total_duration_s += result.duration_s
+        self.last_duration_s = result.duration_s
 
 
 @runtime_checkable
@@ -83,7 +121,7 @@ class InferencePool(Protocol):
 
 
 class StaticInferencePool:
-    """Static inference pool with fixed client list."""
+    """Static inference pool with fixed rollout and admin endpoint lists."""
 
     def __init__(
         self,
@@ -107,6 +145,9 @@ class StaticInferencePool:
         self._skip_model_check = client_config.skip_model_check
         self._wait_for_ready_timeout = client_config.wait_for_ready_timeout
         self._eval_cycle = cycle(self._eval_clients)
+        self._endpoint_stats: dict[str, dict[str, EndpointStats]] = {
+            self._endpoint_key(admin_client): {} for admin_client in self._admin_clients
+        }
         self.model_name = model_name
 
     @property
@@ -136,7 +177,9 @@ class StaticInferencePool:
     async def update_weights(
         self, weight_dir: Path | None, lora_name: str | None = None, step: int = 0, mode: str = "full"
     ) -> None:
-        await update_weights(self._admin_clients, weight_dir, lora_name=lora_name, step=step, mode=mode)
+        await self._record_admin_results(
+            update_weights(self._admin_clients, weight_dir, lora_name=lora_name, step=step, mode=mode)
+        )
 
     async def stage_weights(
         self,
@@ -147,27 +190,55 @@ class StaticInferencePool:
         upload: bool = False,
         upload_method: Literal["multipart", "chunked"] = "multipart",
     ) -> None:
-        await stage_weights(
-            self._admin_clients,
-            weight_path,
-            version=version,
-            mode=mode,
-            base_version=base_version,
-            upload=upload,
-            upload_method=upload_method,
+        await self._record_admin_results(
+            stage_weights(
+                self._admin_clients,
+                weight_path,
+                version=version,
+                mode=mode,
+                base_version=base_version,
+                upload=upload,
+                upload_method=upload_method,
+            )
         )
 
     async def commit_weights(self, version: str, mode: str | None = None) -> None:
-        await commit_weights(self._admin_clients, version=version, mode=mode)
+        await self._record_admin_results(commit_weights(self._admin_clients, version=version, mode=mode))
 
     async def reload_weights(self) -> None:
-        await reload_weights(self._admin_clients)
+        await self._record_admin_results(reload_weights(self._admin_clients))
 
     def get_metrics(self) -> dict[str, float]:
-        return {}
+        metrics: dict[str, float] = {}
+        for endpoint_idx, endpoint in enumerate(self._admin_clients):
+            endpoint_stats = self._endpoint_stats.get(self._endpoint_key(endpoint), {})
+            for operation, stats in endpoint_stats.items():
+                prefix = f"inference_endpoint/{endpoint_idx}/{operation}"
+                metrics[f"{prefix}/requests"] = float(stats.requests)
+                metrics[f"{prefix}/errors"] = float(stats.errors)
+                metrics[f"{prefix}/total_duration_s"] = stats.total_duration_s
+                metrics[f"{prefix}/last_duration_s"] = stats.last_duration_s
+        return metrics
 
     async def stop(self) -> None:
         pass
+
+    def _endpoint_key(self, admin_client: AsyncClient) -> str:
+        return str(admin_client.base_url)
+
+    async def _record_admin_results(self, operation: Awaitable[list[EndpointOperationResult]]) -> None:
+        try:
+            results = await operation
+        except EndpointOperationError as exc:
+            self._record_endpoint_results(exc.results)
+            raise
+        self._record_endpoint_results(results)
+
+    def _record_endpoint_results(self, results: list[EndpointOperationResult]) -> None:
+        for result in results:
+            endpoint_stats = self._endpoint_stats.setdefault(result.endpoint, {})
+            operation_stats = endpoint_stats.setdefault(result.operation, EndpointStats())
+            operation_stats.record(result)
 
 
 async def setup_inference_pool(
@@ -278,6 +349,45 @@ def setup_admin_clients(client_config: ClientConfig) -> list[AsyncClient]:
     return [_setup_admin_client(base_url) for base_url in urls]
 
 
+def _endpoint_key(admin_client: AsyncClient) -> str:
+    return str(admin_client.base_url)
+
+
+def _format_exception(exception: BaseException) -> str:
+    message = str(exception).strip()
+    if message:
+        return f"{exception.__class__.__name__}: {message}"
+    return exception.__class__.__name__
+
+
+async def _run_endpoint_operations(
+    admin_clients: list[AsyncClient],
+    operation: str,
+    call: Callable[[AsyncClient], Awaitable[None]],
+) -> list[EndpointOperationResult]:
+    async def _run(admin_client: AsyncClient) -> EndpointOperationResult:
+        start = time.perf_counter()
+        try:
+            await call(admin_client)
+        except Exception as exc:
+            return EndpointOperationResult(
+                endpoint=_endpoint_key(admin_client),
+                operation=operation,
+                duration_s=time.perf_counter() - start,
+                error=_format_exception(exc),
+            )
+        return EndpointOperationResult(
+            endpoint=_endpoint_key(admin_client),
+            operation=operation,
+            duration_s=time.perf_counter() - start,
+        )
+
+    results = await asyncio.gather(*[_run(admin_client) for admin_client in admin_clients])
+    if any(not result.ok for result in results):
+        raise EndpointOperationError(operation, results)
+    return results
+
+
 async def maybe_check_has_model(
     admin_clients: list[AsyncClient], model_name: str, skip_model_check: bool = False
 ) -> None:
@@ -357,7 +467,7 @@ async def update_weights(
     lora_name: str | None = None,
     step: int = 0,
     mode: str = "full",
-) -> None:
+) -> list[EndpointOperationResult]:
     """Update weights on static inference servers.
 
     Pauses all engines first to drain in-flight requests, then performs the
@@ -373,6 +483,10 @@ async def update_weights(
 
     if lora_name is not None and weight_dir is not None:
         await load_lora_adapter(admin_clients, lora_name, weight_dir)
+        return [
+            EndpointOperationResult(endpoint=_endpoint_key(admin_client), operation="load_lora", duration_s=0.0)
+            for admin_client in admin_clients
+        ]
     else:
 
         async def _update_weights(admin_client: AsyncClient, weight_dir: str | None) -> None:
@@ -390,7 +504,11 @@ async def update_weights(
                 nccl_ready_file.touch()
                 logger.debug(f"Created NCCL_READY marker at {nccl_ready_file}")
 
-            await asyncio.gather(*[_update_weights(admin_client, weight_dir_posix) for admin_client in admin_clients])
+            return await _run_endpoint_operations(
+                admin_clients,
+                "update_weights",
+                lambda admin_client: _update_weights(admin_client, weight_dir_posix),
+            )
         finally:
             await _resume_engines(admin_clients)
 
@@ -404,7 +522,7 @@ async def stage_weights(
     upload: bool = False,
     upload_method: Literal["multipart", "chunked"] = "multipart",
     chunk_size_bytes: int = STAGE_UPLOAD_CHUNK_BYTES,
-) -> None:
+) -> list[EndpointOperationResult]:
     """Stage weights on static inference servers.
 
     By default this records a path that is already visible to the inference
@@ -486,21 +604,25 @@ async def stage_weights(
     if upload:
         upload_path = _upload_path()
         if upload_method == "multipart":
-            await asyncio.gather(*[_stage_multipart_upload(admin_client, upload_path) for admin_client in admin_clients])
+            return await _run_endpoint_operations(
+                admin_clients,
+                "stage_weights",
+                lambda admin_client: _stage_multipart_upload(admin_client, upload_path),
+            )
         else:
             total_size = upload_path.stat().st_size
             expected_sha256 = _sha256_file(upload_path)
-            await asyncio.gather(
-                *[
-                    _stage_chunked_upload(admin_client, upload_path, total_size, expected_sha256)
-                    for admin_client in admin_clients
-                ]
+            return await _run_endpoint_operations(
+                admin_clients,
+                "stage_weights",
+                lambda admin_client: _stage_chunked_upload(admin_client, upload_path, total_size, expected_sha256),
             )
-    else:
-        await asyncio.gather(*[_stage_path(admin_client) for admin_client in admin_clients])
+    return await _run_endpoint_operations(admin_clients, "stage_weights", _stage_path)
 
 
-async def commit_weights(admin_clients: list[AsyncClient], version: str, mode: str | None = None) -> None:
+async def commit_weights(
+    admin_clients: list[AsyncClient], version: str, mode: str | None = None
+) -> list[EndpointOperationResult]:
     """Commit a staged weight version on static inference servers."""
     data = {"version": version}
     if mode is not None:
@@ -512,12 +634,12 @@ async def commit_weights(admin_clients: list[AsyncClient], version: str, mode: s
 
     await _pause_engines(admin_clients)
     try:
-        await asyncio.gather(*[_commit(admin_client) for admin_client in admin_clients])
+        return await _run_endpoint_operations(admin_clients, "commit_weights", _commit)
     finally:
         await _resume_engines(admin_clients)
 
 
-async def reload_weights(admin_clients: list[AsyncClient]) -> None:
+async def reload_weights(admin_clients: list[AsyncClient]) -> list[EndpointOperationResult]:
     """Reload base model weights on static inference servers."""
 
     async def _reload(admin_client: AsyncClient) -> None:
@@ -526,7 +648,7 @@ async def reload_weights(admin_clients: list[AsyncClient]) -> None:
 
     await _pause_engines(admin_clients)
     try:
-        await asyncio.gather(*[_reload(admin_client) for admin_client in admin_clients])
+        return await _run_endpoint_operations(admin_clients, "reload_weights", _reload)
     finally:
         await _resume_engines(admin_clients)
 
