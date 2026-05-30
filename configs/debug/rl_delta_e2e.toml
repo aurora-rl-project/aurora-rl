@@ -12,7 +12,7 @@ gpus_per_node = 4
 type = "filesystem"
 mode = "delta"
 update_protocol = "stage_commit"
-stage_transport = "http_upload"
+stage_transport = "chunked_upload"
 background_stage = true
 
 [model]

@@ -121,7 +121,7 @@ class SharedWeightBroadcastConfig(BaseConfig):
     update_protocol: Literal["direct", "stage_commit"] = "direct"
     """Filesystem inference update protocol. Ignored for NCCL."""
 
-    stage_transport: Literal["shared_fs", "http_upload"] = "shared_fs"
+    stage_transport: Literal["shared_fs", "http_upload", "chunked_upload"] = "shared_fs"
     """Filesystem stage transport. Ignored unless ``update_protocol = "stage_commit"``."""
 
     background_stage: bool = False

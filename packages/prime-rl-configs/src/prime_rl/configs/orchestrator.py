@@ -528,7 +528,7 @@ class FileSystemWeightBroadcastConfig(BaseConfig):
     update_protocol: Literal["direct", "stage_commit"] = "direct"
     """Inference update protocol. ``direct`` calls /update_weights; ``stage_commit`` calls /stage then /commit."""
 
-    stage_transport: Literal["shared_fs", "http_upload"] = "shared_fs"
+    stage_transport: Literal["shared_fs", "http_upload", "chunked_upload"] = "shared_fs"
     """How ``stage_commit`` sends staged weights to inference."""
 
     background_stage: bool = False

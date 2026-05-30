@@ -231,7 +231,7 @@ def test_shared_filesystem_delta_weight_broadcast_mode_propagates():
                 "type": "filesystem",
                 "mode": "delta",
                 "update_protocol": "stage_commit",
-                "stage_transport": "http_upload",
+                "stage_transport": "chunked_upload",
                 "background_stage": True,
             },
             "trainer": {},
@@ -245,7 +245,7 @@ def test_shared_filesystem_delta_weight_broadcast_mode_propagates():
     assert config.orchestrator.weight_broadcast.type == "filesystem"
     assert config.orchestrator.weight_broadcast.mode == "delta"
     assert config.orchestrator.weight_broadcast.update_protocol == "stage_commit"
-    assert config.orchestrator.weight_broadcast.stage_transport == "http_upload"
+    assert config.orchestrator.weight_broadcast.stage_transport == "chunked_upload"
     assert config.orchestrator.weight_broadcast.background_stage is True
 
 

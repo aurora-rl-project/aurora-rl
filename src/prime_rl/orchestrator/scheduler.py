@@ -321,14 +321,17 @@ class Scheduler:
             getattr(self._weight_broadcast_config(), "background_stage", False)
         )
 
-    def _uses_stage_upload(self) -> bool:
+    def _stage_upload_kwargs(self) -> dict[str, object]:
         transport = self._weight_stage_transport()
         if transport == "shared_fs":
-            return False
-        if transport == "http_upload":
+            return {"upload": False}
+        if transport in {"http_upload", "chunked_upload"}:
             if self._weight_update_mode() != "delta":
-                raise ValueError("filesystem http_upload stage transport currently supports delta mode only")
-            return True
+                raise ValueError(f"filesystem {transport} stage transport currently supports delta mode only")
+            upload_kwargs: dict[str, object] = {"upload": True}
+            if transport == "chunked_upload":
+                upload_kwargs["upload_method"] = "chunked"
+            return upload_kwargs
         raise ValueError(f"unsupported filesystem stage transport: {transport}")
 
     async def _apply_policy_update(self, next_ckpt_step: int) -> None:
@@ -384,7 +387,7 @@ class Scheduler:
                 version=version,
                 mode=mode,
                 base_version=base_version,
-                upload=self._uses_stage_upload(),
+                **self._stage_upload_kwargs(),
             )
             self.stage_weights_time = time.perf_counter() - stage_start_time
 
@@ -425,7 +428,7 @@ class Scheduler:
             version=version,
             mode=mode,
             base_version=base_version,
-            upload=self._uses_stage_upload(),
+            **self._stage_upload_kwargs(),
         )
         stage_time = time.perf_counter() - stage_start_time
         self.logger.debug(

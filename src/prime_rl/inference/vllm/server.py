@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import time
 from argparse import Namespace
 from pathlib import Path
@@ -60,6 +61,8 @@ def models(request: Request) -> OpenAIServingModels:
 def _ensure_weight_staging_state(state: State) -> None:
     if not hasattr(state, "staged_versions"):
         state.staged_versions = {}
+    if not hasattr(state, "stage_uploads"):
+        state.stage_uploads = {}
     if not hasattr(state, "active_version"):
         state.active_version = None
     if not hasattr(state, "staging_dir"):
@@ -106,6 +109,78 @@ def _cleanup_staged_file(state: State, entry: dict[str, Any]) -> None:
         path.unlink()
 
 
+def _cleanup_stage_upload(state: State, upload: dict[str, Any]) -> None:
+    path = Path(upload["path"])
+    staging_dir = Path(state.staging_dir)
+    if path.is_file() and path.parent == staging_dir:
+        path.unlink()
+
+
+def _stage_upload_key(version: str, mode: str) -> str:
+    return f"{version}:{mode}"
+
+
+def _parse_non_negative_int(fields: dict[str, Any], name: str) -> int | JSONResponse:
+    value = fields.get(name)
+    if value is None:
+        return _error_response(400, f"{name} is required")
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return _error_response(400, f"{name} must be an integer")
+    if parsed < 0:
+        return _error_response(400, f"{name} must be non-negative")
+    return parsed
+
+
+def _validate_stage_metadata(state: State, fields: dict[str, Any]) -> tuple[str, str, Any, Any] | JSONResponse:
+    version = str(fields.get("version", "unknown"))
+    mode = str(fields.get("mode", "full"))
+    base_version = fields.get("base_version")
+    active_version = state.active_version
+
+    if mode not in WEIGHT_UPDATE_MODES:
+        return _error_response(400, f"unsupported weight update mode: {mode}")
+    if mode == "delta" and base_version and active_version and base_version != active_version:
+        return _error_response(409, f"base_version mismatch: current={active_version}, got={base_version}")
+
+    return version, mode, base_version, active_version
+
+
+def _merge_received_range(ranges: list[tuple[int, int]], start: int, end: int) -> list[tuple[int, int]]:
+    if start >= end:
+        return ranges
+    ranges.append((start, end))
+    ranges.sort()
+
+    merged: list[tuple[int, int]] = []
+    for range_start, range_end in ranges:
+        if not merged or range_start > merged[-1][1]:
+            merged.append((range_start, range_end))
+            continue
+        previous_start, previous_end = merged[-1]
+        merged[-1] = (previous_start, max(previous_end, range_end))
+    return merged
+
+
+def _received_bytes(ranges: list[tuple[int, int]]) -> int:
+    return sum(end - start for start, end in ranges)
+
+
+def _upload_complete(ranges: list[tuple[int, int]], total_size: int) -> bool:
+    if total_size == 0:
+        return ranges == []
+    return len(ranges) == 1 and ranges[0] == (0, total_size)
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as f:
+        while chunk := f.read(STAGE_READ_CHUNK_BYTES):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 WORKER_EXTENSION_CLS = {
     "nccl": "prime_rl.inference.vllm.worker.nccl.NCCLWeightUpdateWorker",
     "filesystem": "prime_rl.inference.vllm.worker.filesystem.FileSystemWeightUpdateWorker",
@@ -143,15 +218,10 @@ async def stage_weights(request: Request):
     """Stage full or delta weights on the local inference server."""
     _ensure_weight_staging_state(request.app.state)
     fields, uploaded_file = await _read_request_fields(request)
-    version = str(fields.get("version", "unknown"))
-    mode = str(fields.get("mode", "full"))
-    base_version = fields.get("base_version")
-    active_version = request.app.state.active_version
-
-    if mode not in WEIGHT_UPDATE_MODES:
-        return _error_response(400, f"unsupported weight update mode: {mode}")
-    if mode == "delta" and base_version and active_version and base_version != active_version:
-        return _error_response(409, f"base_version mismatch: current={active_version}, got={base_version}")
+    metadata = _validate_stage_metadata(request.app.state, fields)
+    if isinstance(metadata, JSONResponse):
+        return metadata
+    version, mode, base_version, active_version = metadata
 
     ingest_start = time.perf_counter()
     suffix = "delta" if mode == "delta" else "full"
@@ -181,6 +251,143 @@ async def stage_weights(request: Request):
         base_version,
         active_version,
         owned,
+        ingest_ms,
+    )
+    return {"status": "ok", "version": version, "mode": mode, "path": staged_path.as_posix(), "ingest_ms": ingest_ms}
+
+
+@router.post("/stage_chunk")
+async def stage_chunk(request: Request):
+    """Upload one chunk of a staged weight file to the local inference server."""
+    _ensure_weight_staging_state(request.app.state)
+    fields, uploaded_file = await _read_request_fields(request)
+    metadata = _validate_stage_metadata(request.app.state, fields)
+    if isinstance(metadata, JSONResponse):
+        return metadata
+    version, mode, base_version, _active_version = metadata
+
+    if uploaded_file is None:
+        return _error_response(400, "file chunk is required")
+
+    offset = _parse_non_negative_int(fields, "offset")
+    if isinstance(offset, JSONResponse):
+        return offset
+    total_size = _parse_non_negative_int(fields, "total_size")
+    if isinstance(total_size, JSONResponse):
+        return total_size
+
+    expected_sha256 = fields.get("sha256")
+    if expected_sha256 is None:
+        return _error_response(400, "sha256 is required")
+    expected_sha256 = str(expected_sha256)
+
+    filename = _safe_path_component(Path(str(fields.get("filename") or uploaded_file.filename or "weights")).name)
+    chunk = await uploaded_file.read()
+    end_offset = offset + len(chunk)
+    if end_offset > total_size:
+        return _error_response(400, f"chunk exceeds total_size: offset={offset}, size={len(chunk)}, total={total_size}")
+
+    suffix = "delta" if mode == "delta" else "full"
+    key = _stage_upload_key(version, mode)
+    upload = request.app.state.stage_uploads.get(key)
+    if upload is None:
+        temp_path = request.app.state.staging_dir / f"{_safe_path_component(version)}_{suffix}_{filename}.part"
+        upload = {
+            "path": temp_path,
+            "filename": filename,
+            "mode": mode,
+            "base_version": base_version,
+            "total_size": total_size,
+            "sha256": expected_sha256,
+            "ranges": [],
+            "chunks": 0,
+            "start_time": time.perf_counter(),
+        }
+        request.app.state.stage_uploads[key] = upload
+    elif (
+        upload["filename"] != filename
+        or upload["total_size"] != total_size
+        or upload["sha256"] != expected_sha256
+        or upload["base_version"] != base_version
+    ):
+        return _error_response(409, "chunk metadata does not match active upload")
+
+    temp_path = Path(upload["path"])
+    with temp_path.open("r+b" if temp_path.exists() else "w+b") as f:
+        f.seek(offset)
+        f.write(chunk)
+
+    upload["ranges"] = _merge_received_range(upload["ranges"], offset, end_offset)
+    upload["chunks"] += 1
+    return {
+        "status": "ok",
+        "version": version,
+        "mode": mode,
+        "received_bytes": _received_bytes(upload["ranges"]),
+        "total_size": total_size,
+    }
+
+
+@router.post("/stage_finalize")
+async def stage_finalize(request: Request):
+    """Finalize a chunked staged upload and make it available for /commit."""
+    _ensure_weight_staging_state(request.app.state)
+    fields, _ = await _read_request_fields(request)
+    metadata = _validate_stage_metadata(request.app.state, fields)
+    if isinstance(metadata, JSONResponse):
+        return metadata
+    version, mode, base_version, active_version = metadata
+
+    total_size = _parse_non_negative_int(fields, "total_size")
+    if isinstance(total_size, JSONResponse):
+        return total_size
+    expected_sha256 = fields.get("sha256")
+    if expected_sha256 is None:
+        return _error_response(400, "sha256 is required")
+    expected_sha256 = str(expected_sha256)
+
+    filename = _safe_path_component(Path(str(fields.get("filename") or "weights")).name)
+    key = _stage_upload_key(version, mode)
+    upload = request.app.state.stage_uploads.get(key)
+    if upload is None:
+        return _error_response(404, f"upload for version {version} not found")
+    if (
+        upload["filename"] != filename
+        or upload["total_size"] != total_size
+        or upload["sha256"] != expected_sha256
+        or upload["base_version"] != base_version
+    ):
+        return _error_response(409, "finalize metadata does not match active upload")
+
+    ranges = upload["ranges"]
+    if not _upload_complete(ranges, total_size):
+        return _error_response(409, f"upload incomplete: received={_received_bytes(ranges)} total={total_size}")
+
+    temp_path = Path(upload["path"])
+    actual_sha256 = _file_sha256(temp_path)
+    if actual_sha256 != expected_sha256:
+        _cleanup_stage_upload(request.app.state, upload)
+        request.app.state.stage_uploads.pop(key, None)
+        return _error_response(409, f"sha256 mismatch: expected={expected_sha256}, got={actual_sha256}")
+
+    suffix = "delta" if mode == "delta" else "full"
+    staged_path = request.app.state.staging_dir / f"{_safe_path_component(version)}_{suffix}_{filename}"
+    if staged_path.exists():
+        staged_path.unlink()
+    temp_path.replace(staged_path)
+
+    request.app.state.staged_versions[version] = {"path": staged_path, "mode": mode, "owned": True}
+    request.app.state.stage_uploads.pop(key, None)
+    ingest_ms = (time.perf_counter() - upload["start_time"]) * 1000
+    logger.info(
+        "Staged %s weights version %s from %s via chunked upload "
+        "(base_version=%s active_version=%s owned=True chunks=%s ingest_ms=%.2f)",
+        mode,
+        version,
+        staged_path.as_posix(),
+        base_version,
+        active_version,
+        upload["chunks"],
         ingest_ms,
     )
     return {"status": "ok", "version": version, "mode": mode, "path": staged_path.as_posix(), "ingest_ms": ingest_ms}
@@ -232,8 +439,11 @@ async def reload_weights(request: Request):
     await engine_client(request).collective_rpc("reload_weights")
     for entry in list(request.app.state.staged_versions.values()):
         _cleanup_staged_file(request.app.state, entry)
+    for upload in list(request.app.state.stage_uploads.values()):
+        _cleanup_stage_upload(request.app.state, upload)
     request.app.state.active_version = None
     request.app.state.staged_versions.clear()
+    request.app.state.stage_uploads.clear()
     logger.info("Reloaded base weights and cleared staged weight versions")
     return {"status": "ok"}
 
@@ -297,6 +507,7 @@ async def custom_init_app_state(
     state.liveness_timeout_seconds = args.liveness_timeout_seconds
     state.staging_dir = Path(getattr(args, "staging_dir", "staging"))
     state.staged_versions = {}
+    state.stage_uploads = {}
     state.active_version = None
     state.staging_dir.mkdir(parents=True, exist_ok=True)
 

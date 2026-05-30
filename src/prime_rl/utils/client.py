@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 from itertools import cycle
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import Literal, Protocol, runtime_checkable
 
 import httpx
 import verifiers as vf
@@ -15,6 +16,8 @@ from tenacity import retry, retry_if_exception, stop_after_attempt, stop_after_d
 
 from prime_rl.configs.shared import ClientConfig
 from prime_rl.utils.logger import get_logger
+
+STAGE_UPLOAD_CHUNK_BYTES = 16 * 1024 * 1024
 
 
 @runtime_checkable
@@ -61,6 +64,7 @@ class InferencePool(Protocol):
         mode: str = "full",
         base_version: str | None = None,
         upload: bool = False,
+        upload_method: Literal["multipart", "chunked"] = "multipart",
     ) -> None:
         """Stage weights on all inference servers."""
         ...
@@ -141,6 +145,7 @@ class StaticInferencePool:
         mode: str = "full",
         base_version: str | None = None,
         upload: bool = False,
+        upload_method: Literal["multipart", "chunked"] = "multipart",
     ) -> None:
         await stage_weights(
             self._admin_clients,
@@ -149,6 +154,7 @@ class StaticInferencePool:
             mode=mode,
             base_version=base_version,
             upload=upload,
+            upload_method=upload_method,
         )
 
     async def commit_weights(self, version: str, mode: str | None = None) -> None:
@@ -396,38 +402,100 @@ async def stage_weights(
     mode: str = "full",
     base_version: str | None = None,
     upload: bool = False,
+    upload_method: Literal["multipart", "chunked"] = "multipart",
+    chunk_size_bytes: int = STAGE_UPLOAD_CHUNK_BYTES,
 ) -> None:
     """Stage weights on static inference servers.
 
     By default this records a path that is already visible to the inference
     server, matching the shared-filesystem delta path used by local migration
     runs. Set ``upload=True`` to stream a single file to the server's staging
-    directory.
+    directory. ``upload_method="chunked"`` uses offset-based chunk upload plus
+    final size/hash verification.
     """
     if mode not in {"full", "delta"}:
         raise ValueError(f"unsupported weight update mode: {mode}")
+    if upload_method not in {"multipart", "chunked"}:
+        raise ValueError(f"unsupported stage upload method: {upload_method}")
+    if chunk_size_bytes <= 0:
+        raise ValueError("chunk_size_bytes must be positive")
 
     data = {"version": version, "mode": mode}
     if base_version is not None:
         data["base_version"] = base_version
 
-    async def _stage_path(admin_client: AsyncClient) -> None:
-        response = await admin_client.post("/stage", data={**data, "path": weight_path.as_posix()})
-        response.raise_for_status()
-
-    async def _stage_upload(admin_client: AsyncClient) -> None:
+    def _upload_path() -> Path:
         upload_path = weight_path
         if upload_path.is_dir():
             if mode != "delta":
                 raise ValueError("upload=True requires a file path for full checkpoint staging")
             upload_path = upload_path / "delta.safetensors"
+        return upload_path
+
+    def _sha256_file(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as f:
+            while chunk := f.read(STAGE_UPLOAD_CHUNK_BYTES):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    async def _stage_path(admin_client: AsyncClient) -> None:
+        response = await admin_client.post("/stage", data={**data, "path": weight_path.as_posix()})
+        response.raise_for_status()
+
+    async def _stage_multipart_upload(admin_client: AsyncClient, upload_path: Path) -> None:
         with upload_path.open("rb") as f:
             files = {"file": (upload_path.name, f, "application/octet-stream")}
             response = await admin_client.post("/stage", data=data, files=files)
         response.raise_for_status()
 
+    async def _stage_chunked_upload(
+        admin_client: AsyncClient,
+        upload_path: Path,
+        total_size: int,
+        expected_sha256: str,
+    ) -> None:
+        chunk_data = {
+            **data,
+            "filename": upload_path.name,
+            "total_size": str(total_size),
+            "sha256": expected_sha256,
+        }
+        with upload_path.open("rb") as f:
+            offset = 0
+            sent_chunk = False
+            while chunk := f.read(chunk_size_bytes):
+                sent_chunk = True
+                files = {"file": (upload_path.name, chunk, "application/octet-stream")}
+                response = await admin_client.post(
+                    "/stage_chunk",
+                    data={**chunk_data, "offset": str(offset)},
+                    files=files,
+                )
+                response.raise_for_status()
+                offset += len(chunk)
+
+            if not sent_chunk:
+                files = {"file": (upload_path.name, b"", "application/octet-stream")}
+                response = await admin_client.post("/stage_chunk", data={**chunk_data, "offset": "0"}, files=files)
+                response.raise_for_status()
+
+        response = await admin_client.post("/stage_finalize", data=chunk_data)
+        response.raise_for_status()
+
     if upload:
-        await asyncio.gather(*[_stage_upload(admin_client) for admin_client in admin_clients])
+        upload_path = _upload_path()
+        if upload_method == "multipart":
+            await asyncio.gather(*[_stage_multipart_upload(admin_client, upload_path) for admin_client in admin_clients])
+        else:
+            total_size = upload_path.stat().st_size
+            expected_sha256 = _sha256_file(upload_path)
+            await asyncio.gather(
+                *[
+                    _stage_chunked_upload(admin_client, upload_path, total_size, expected_sha256)
+                    for admin_client in admin_clients
+                ]
+            )
     else:
         await asyncio.gather(*[_stage_path(admin_client) for admin_client in admin_clients])
 

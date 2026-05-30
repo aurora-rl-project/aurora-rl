@@ -222,6 +222,18 @@ def test_policy_update_can_use_stage_commit_protocol():
     asyncio.run(run())
 
 
+def test_chunked_stage_transport_uses_chunked_upload_method():
+    scheduler = make_scheduler()
+    scheduler.config.weight_broadcast = SimpleNamespace(
+        type="filesystem",
+        mode="delta",
+        update_protocol="stage_commit",
+        stage_transport="chunked_upload",
+    )
+
+    assert scheduler._stage_upload_kwargs() == {"upload": True, "upload_method": "chunked"}
+
+
 def test_background_stage_does_not_clear_checkpoint_ready_until_commit():
     async def run() -> None:
         scheduler = make_scheduler()

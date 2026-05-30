@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 from urllib.parse import parse_qs
 
 import httpx
@@ -23,6 +24,7 @@ def make_app(tmp_path):
     app.state.staging_dir = tmp_path / "staging"
     app.state.staging_dir.mkdir()
     app.state.staged_versions = {}
+    app.state.stage_uploads = {}
     app.state.active_version = None
     return app
 
@@ -116,6 +118,132 @@ def test_client_stage_uploads_delta_file(tmp_path) -> None:
     assert staged["mode"] == "delta"
     assert staged_path.parent == app.state.staging_dir
     assert staged_path.read_bytes() == b"uploaded-delta"
+
+
+def test_client_stage_chunk_uploads_delta_file(tmp_path) -> None:
+    delta_dir = tmp_path / "step_1"
+    delta_dir.mkdir()
+    delta_file = delta_dir / "delta.safetensors"
+    delta_file.write_bytes(b"chunked-delta-upload")
+    app = make_app(tmp_path)
+
+    async def run() -> None:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            await stage_weights(
+                [client],
+                delta_dir,
+                version="1",
+                mode="delta",
+                base_version="0",
+                upload=True,
+                upload_method="chunked",
+                chunk_size_bytes=5,
+            )
+
+    asyncio.run(run())
+
+    staged = app.state.staged_versions["1"]
+    staged_path = staged["path"]
+    assert app.state.stage_uploads == {}
+    assert staged["owned"] is True
+    assert staged["mode"] == "delta"
+    assert staged_path.parent == app.state.staging_dir
+    assert staged_path.read_bytes() == b"chunked-delta-upload"
+
+
+def test_stage_chunk_finalize_accepts_out_of_order_chunks(tmp_path) -> None:
+    app = make_app(tmp_path)
+    content = b"first-second"
+    digest = hashlib.sha256(content).hexdigest()
+
+    async def run() -> None:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            common_data = {
+                "version": "1",
+                "mode": "delta",
+                "base_version": "0",
+                "filename": "delta.safetensors",
+                "total_size": str(len(content)),
+                "sha256": digest,
+            }
+            second_response = await client.post(
+                "/stage_chunk",
+                data={**common_data, "offset": "6"},
+                files={"file": ("delta.safetensors", content[6:], "application/octet-stream")},
+            )
+            assert second_response.status_code == 200
+            first_response = await client.post(
+                "/stage_chunk",
+                data={**common_data, "offset": "0"},
+                files={"file": ("delta.safetensors", content[:6], "application/octet-stream")},
+            )
+            assert first_response.status_code == 200
+            finalize_response = await client.post("/stage_finalize", data=common_data)
+            assert finalize_response.status_code == 200
+
+    asyncio.run(run())
+
+    staged_path = app.state.staged_versions["1"]["path"]
+    assert staged_path.read_bytes() == content
+
+
+def test_stage_chunk_finalize_rejects_missing_chunk(tmp_path) -> None:
+    app = make_app(tmp_path)
+    content = b"incomplete"
+    digest = hashlib.sha256(content).hexdigest()
+
+    async def run() -> None:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            common_data = {
+                "version": "1",
+                "mode": "delta",
+                "base_version": "0",
+                "filename": "delta.safetensors",
+                "total_size": str(len(content)),
+                "sha256": digest,
+            }
+            chunk_response = await client.post(
+                "/stage_chunk",
+                data={**common_data, "offset": "0"},
+                files={"file": ("delta.safetensors", content[:5], "application/octet-stream")},
+            )
+            assert chunk_response.status_code == 200
+            finalize_response = await client.post("/stage_finalize", data=common_data)
+            assert finalize_response.status_code == 409
+
+    asyncio.run(run())
+
+    assert app.state.staged_versions == {}
+    assert app.state.stage_uploads
+
+
+def test_stage_chunk_finalize_rejects_hash_mismatch(tmp_path) -> None:
+    app = make_app(tmp_path)
+    content = b"corrupted"
+
+    async def run() -> None:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            common_data = {
+                "version": "1",
+                "mode": "delta",
+                "base_version": "0",
+                "filename": "delta.safetensors",
+                "total_size": str(len(content)),
+                "sha256": "0" * 64,
+            }
+            chunk_response = await client.post(
+                "/stage_chunk",
+                data={**common_data, "offset": "0"},
+                files={"file": ("delta.safetensors", content, "application/octet-stream")},
+            )
+            assert chunk_response.status_code == 200
+            finalize_response = await client.post("/stage_finalize", data=common_data)
+            assert finalize_response.status_code == 409
+
+    asyncio.run(run())
+
+    assert app.state.staged_versions == {}
+    assert app.state.stage_uploads == {}
 
 
 def test_client_stage_commit_reload_helpers(tmp_path) -> None:
