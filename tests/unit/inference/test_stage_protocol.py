@@ -191,6 +191,151 @@ def test_client_stage_chunk_uploads_delta_file_to_multiple_endpoints(tmp_path) -
         assert staged["path"].read_bytes() == b"multi-endpoint-delta"
 
 
+def test_client_stage_streams_growing_delta_file(tmp_path) -> None:
+    delta_dir = tmp_path / "step_1"
+    delta_dir.mkdir()
+    delta_file = delta_dir / "delta.safetensors"
+    stable_file = delta_dir / "STABLE"
+    app = make_app(tmp_path)
+
+    async def run() -> None:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            stage_task = asyncio.create_task(
+                stage_weights(
+                    [client],
+                    delta_dir,
+                    version="1",
+                    mode="delta",
+                    base_version="0",
+                    upload=True,
+                    upload_method="streaming",
+                    chunk_size_bytes=4,
+                    done_path=stable_file,
+                    poll_interval_s=0.01,
+                )
+            )
+
+            await asyncio.sleep(0.02)
+            delta_file.write_bytes(b"stream-")
+            await asyncio.sleep(0.02)
+            with delta_file.open("ab") as f:
+                f.write(b"delta-upload")
+            stable_file.touch()
+            return await stage_task
+
+    results = asyncio.run(run())
+
+    staged = app.state.staged_versions["1"]
+    assert [result.endpoint for result in results] == ["http://test"]
+    assert all(result.ok for result in results)
+    assert staged["owned"] is True
+    assert staged["mode"] == "delta"
+    assert staged["path"].read_bytes() == b"stream-delta-upload"
+
+
+def test_stage_stream_finalize_accepts_complete_upload(tmp_path) -> None:
+    app = make_app(tmp_path)
+    content = b"streaming-delta"
+    digest = hashlib.sha256(content).hexdigest()
+
+    async def run() -> None:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            init_response = await client.post(
+                "/stage_stream_init",
+                json={"version": "1", "mode": "delta", "base_version": "0", "filename": "delta.safetensors"},
+            )
+            assert init_response.status_code == 200
+            upload_id = init_response.json()["upload_id"]
+
+            first_response = await client.post(
+                "/stage_stream_chunk",
+                params={"upload_id": upload_id, "offset": "0"},
+                content=content[:6],
+            )
+            assert first_response.status_code == 200
+            second_response = await client.post(
+                "/stage_stream_chunk",
+                params={"upload_id": upload_id, "offset": "6"},
+                content=content[6:],
+            )
+            assert second_response.status_code == 200
+
+            finalize_response = await client.post(
+                "/stage_stream_finalize",
+                data={"upload_id": upload_id, "final_size": str(len(content)), "sha256": digest},
+            )
+            assert finalize_response.status_code == 200
+
+    asyncio.run(run())
+
+    staged = app.state.staged_versions["1"]
+    assert staged["owned"] is True
+    assert staged["path"].read_bytes() == content
+    assert app.state.stage_uploads == {}
+
+
+def test_stage_stream_finalize_rejects_missing_range(tmp_path) -> None:
+    app = make_app(tmp_path)
+    content = b"incomplete"
+
+    async def run() -> None:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            init_response = await client.post(
+                "/stage_stream_init",
+                json={"version": "1", "mode": "delta", "base_version": "0", "filename": "delta.safetensors"},
+            )
+            assert init_response.status_code == 200
+            upload_id = init_response.json()["upload_id"]
+
+            chunk_response = await client.post(
+                "/stage_stream_chunk",
+                params={"upload_id": upload_id, "offset": "0"},
+                content=content[:5],
+            )
+            assert chunk_response.status_code == 200
+            finalize_response = await client.post(
+                "/stage_stream_finalize",
+                data={"upload_id": upload_id, "final_size": str(len(content))},
+            )
+            assert finalize_response.status_code == 409
+
+    asyncio.run(run())
+
+    assert app.state.staged_versions == {}
+    assert app.state.stage_uploads
+
+
+def test_stage_stream_finalize_rejects_hash_mismatch(tmp_path) -> None:
+    app = make_app(tmp_path)
+    content = b"corrupted"
+
+    async def run() -> None:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            init_response = await client.post(
+                "/stage_stream_init",
+                json={"version": "1", "mode": "delta", "base_version": "0", "filename": "delta.safetensors"},
+            )
+            assert init_response.status_code == 200
+            upload_id = init_response.json()["upload_id"]
+
+            chunk_response = await client.post(
+                "/stage_stream_chunk",
+                params={"upload_id": upload_id, "offset": "0"},
+                content=content,
+            )
+            assert chunk_response.status_code == 200
+            finalize_response = await client.post(
+                "/stage_stream_finalize",
+                data={"upload_id": upload_id, "final_size": str(len(content)), "sha256": "0" * 64},
+            )
+            assert finalize_response.status_code == 409
+
+    asyncio.run(run())
+
+    assert app.state.staged_versions == {}
+    assert app.state.stage_uploads == {}
+
+
 def test_stage_chunk_finalize_accepts_out_of_order_chunks(tmp_path) -> None:
     app = make_app(tmp_path)
     content = b"first-second"

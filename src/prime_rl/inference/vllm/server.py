@@ -4,6 +4,7 @@ import time
 from argparse import Namespace
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import uvloop
 from fastapi import APIRouter, Request
@@ -118,6 +119,10 @@ def _cleanup_stage_upload(state: State, upload: dict[str, Any]) -> None:
 
 def _stage_upload_key(version: str, mode: str) -> str:
     return f"{version}:{mode}"
+
+
+def _stage_stream_upload_key(upload_id: str) -> str:
+    return f"stream:{upload_id}"
 
 
 def _parse_non_negative_int(fields: dict[str, Any], name: str) -> int | JSONResponse:
@@ -254,6 +259,164 @@ async def stage_weights(request: Request):
         ingest_ms,
     )
     return {"status": "ok", "version": version, "mode": mode, "path": staged_path.as_posix(), "ingest_ms": ingest_ms}
+
+
+@router.post("/stage_stream_init")
+async def stage_stream_init(request: Request):
+    """Initialize a streaming staged upload."""
+    _ensure_weight_staging_state(request.app.state)
+    fields, _ = await _read_request_fields(request)
+    metadata = _validate_stage_metadata(request.app.state, fields)
+    if isinstance(metadata, JSONResponse):
+        return metadata
+    version, mode, base_version, active_version = metadata
+
+    filename = fields.get("filename")
+    if filename is None:
+        return _error_response(400, "filename is required")
+    filename = _safe_path_component(Path(str(filename)).name)
+
+    upload_id = uuid4().hex
+    suffix = "delta" if mode == "delta" else "full"
+    temp_path = request.app.state.staging_dir / f"{_safe_path_component(version)}_{suffix}_{filename}.stream.part"
+    staged_path = request.app.state.staging_dir / f"{_safe_path_component(version)}_{suffix}_{filename}"
+    temp_path.parent.mkdir(parents=True, exist_ok=True)
+    with temp_path.open("wb"):
+        pass
+
+    request.app.state.stage_uploads[_stage_stream_upload_key(upload_id)] = {
+        "path": temp_path,
+        "staged_path": staged_path,
+        "filename": filename,
+        "mode": mode,
+        "version": version,
+        "base_version": base_version,
+        "ranges": [],
+        "chunks": 0,
+        "start_time": time.perf_counter(),
+        "streaming": True,
+    }
+    logger.info(
+        "Initialized streaming stage for %s weights version %s "
+        "(base_version=%s active_version=%s upload_id=%s)",
+        mode,
+        version,
+        base_version,
+        active_version,
+        upload_id,
+    )
+    return {"status": "ok", "upload_id": upload_id, "version": version, "mode": mode}
+
+
+@router.post("/stage_stream_chunk")
+async def stage_stream_chunk(request: Request):
+    """Upload one raw streaming chunk for a staged weight file."""
+    _ensure_weight_staging_state(request.app.state)
+    fields = dict(request.query_params)
+    upload_id = fields.get("upload_id")
+    if upload_id is None:
+        return _error_response(400, "upload_id is required")
+
+    offset = _parse_non_negative_int(fields, "offset")
+    if isinstance(offset, JSONResponse):
+        return offset
+
+    upload = request.app.state.stage_uploads.get(_stage_stream_upload_key(str(upload_id)))
+    if upload is None:
+        return _error_response(404, f"streaming upload {upload_id} not found")
+
+    chunk = await request.body()
+    if not chunk:
+        return _error_response(400, "chunk body is required")
+    end_offset = offset + len(chunk)
+
+    temp_path = Path(upload["path"])
+    with temp_path.open("r+b" if temp_path.exists() else "w+b") as f:
+        f.seek(offset)
+        f.write(chunk)
+
+    upload["ranges"] = _merge_received_range(upload["ranges"], offset, end_offset)
+    upload["chunks"] += 1
+    return {
+        "status": "ok",
+        "upload_id": upload_id,
+        "version": upload["version"],
+        "mode": upload["mode"],
+        "received_bytes": _received_bytes(upload["ranges"]),
+    }
+
+
+@router.post("/stage_stream_finalize")
+async def stage_stream_finalize(request: Request):
+    """Finalize a streaming staged upload and make it available for /commit."""
+    _ensure_weight_staging_state(request.app.state)
+    fields, _ = await _read_request_fields(request)
+    upload_id = fields.get("upload_id")
+    if upload_id is None:
+        return _error_response(400, "upload_id is required")
+
+    final_size = _parse_non_negative_int(fields, "final_size")
+    if isinstance(final_size, JSONResponse):
+        return final_size
+
+    upload_key = _stage_stream_upload_key(str(upload_id))
+    upload = request.app.state.stage_uploads.get(upload_key)
+    if upload is None:
+        return _error_response(404, f"streaming upload {upload_id} not found")
+
+    if upload["mode"] == "delta":
+        base_version = upload["base_version"]
+        active_version = request.app.state.active_version
+        if base_version and active_version and base_version != active_version:
+            return _error_response(409, f"base_version mismatch: current={active_version}, got={base_version}")
+
+    ranges = upload["ranges"]
+    if not _upload_complete(ranges, final_size):
+        return _error_response(409, f"upload incomplete: received={_received_bytes(ranges)} total={final_size}")
+
+    temp_path = Path(upload["path"])
+    if not temp_path.exists():
+        return _error_response(404, f"streaming upload file for {upload_id} not found")
+    actual_size = temp_path.stat().st_size
+    if actual_size != final_size:
+        return _error_response(409, f"final_size mismatch: expected={final_size}, got={actual_size}")
+
+    expected_sha256 = fields.get("sha256")
+    if expected_sha256 is not None:
+        expected_sha256 = str(expected_sha256)
+        actual_sha256 = _file_sha256(temp_path)
+        if actual_sha256 != expected_sha256:
+            _cleanup_stage_upload(request.app.state, upload)
+            request.app.state.stage_uploads.pop(upload_key, None)
+            return _error_response(409, f"sha256 mismatch: expected={expected_sha256}, got={actual_sha256}")
+
+    staged_path = Path(upload["staged_path"])
+    if staged_path.exists():
+        staged_path.unlink()
+    temp_path.replace(staged_path)
+
+    version = str(upload["version"])
+    request.app.state.staged_versions[version] = {"path": staged_path, "mode": upload["mode"], "owned": True}
+    request.app.state.stage_uploads.pop(upload_key, None)
+    ingest_ms = (time.perf_counter() - upload["start_time"]) * 1000
+    logger.info(
+        "Staged %s weights version %s from %s via streaming upload "
+        "(base_version=%s active_version=%s owned=True chunks=%s ingest_ms=%.2f)",
+        upload["mode"],
+        version,
+        staged_path.as_posix(),
+        upload["base_version"],
+        request.app.state.active_version,
+        upload["chunks"],
+        ingest_ms,
+    )
+    return {
+        "status": "ok",
+        "version": version,
+        "mode": upload["mode"],
+        "path": staged_path.as_posix(),
+        "ingest_ms": ingest_ms,
+    }
 
 
 @router.post("/stage_chunk")

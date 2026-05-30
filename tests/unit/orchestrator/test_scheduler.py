@@ -234,6 +234,63 @@ def test_chunked_stage_transport_uses_chunked_upload_method():
     assert scheduler._stage_upload_kwargs() == {"upload": True, "upload_method": "chunked"}
 
 
+def test_streaming_stage_transport_uses_streaming_upload_method():
+    scheduler = make_scheduler()
+    scheduler.config.weight_broadcast = SimpleNamespace(
+        type="filesystem",
+        mode="delta",
+        update_protocol="stage_commit",
+        stage_transport="streaming_upload",
+    )
+
+    assert scheduler._stage_upload_kwargs() == {"upload": True, "upload_method": "streaming"}
+
+
+def test_streaming_background_stage_waits_for_delta_file_and_finalizes_on_stable():
+    async def run() -> None:
+        scheduler = make_scheduler()
+        scheduler.config.weight_broadcast = SimpleNamespace(
+            type="filesystem",
+            mode="delta",
+            update_protocol="stage_commit",
+            stage_transport="streaming_upload",
+            background_stage=True,
+        )
+        calls: list[tuple[str, object]] = []
+
+        async def wait_for_ready(path) -> None:
+            calls.append(("wait", path))
+
+        async def stage_weights(
+            weight_path,
+            version,
+            mode="full",
+            base_version=None,
+            upload=False,
+            upload_method="multipart",
+            done_path=None,
+        ) -> None:
+            calls.append(("stage", weight_path, version, mode, base_version, upload, upload_method, done_path))
+
+        scheduler.student_inference = SimpleNamespace(
+            update_weights=AsyncMock(),
+            stage_weights=stage_weights,
+            commit_weights=AsyncMock(),
+            update_model_name=MagicMock(),
+        )
+
+        with patch("prime_rl.orchestrator.scheduler.wait_for_path", new=wait_for_ready):
+            await scheduler._stage_policy_update(8)
+
+        step_path = Path("/tmp/prime-rl-test/broadcasts/step_8")
+        assert calls == [
+            ("wait", step_path / "delta.safetensors"),
+            ("stage", step_path, "8", "delta", "7", True, "streaming", step_path / "STABLE"),
+        ]
+
+    asyncio.run(run())
+
+
 def test_background_stage_does_not_clear_checkpoint_ready_until_commit():
     async def run() -> None:
         scheduler = make_scheduler()

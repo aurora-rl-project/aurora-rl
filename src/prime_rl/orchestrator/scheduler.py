@@ -325,14 +325,21 @@ class Scheduler:
         transport = self._weight_stage_transport()
         if transport == "shared_fs":
             return {"upload": False}
-        if transport in {"http_upload", "chunked_upload"}:
+        if transport in {"http_upload", "chunked_upload", "streaming_upload"}:
             if self._weight_update_mode() != "delta":
                 raise ValueError(f"filesystem {transport} stage transport currently supports delta mode only")
             upload_kwargs: dict[str, object] = {"upload": True}
             if transport == "chunked_upload":
                 upload_kwargs["upload_method"] = "chunked"
+            elif transport == "streaming_upload":
+                upload_kwargs["upload_method"] = "streaming"
             return upload_kwargs
         raise ValueError(f"unsupported filesystem stage transport: {transport}")
+
+    def _stage_ready_path(self, weights_path: Path, stable_path: Path) -> Path:
+        if self._weight_stage_transport() == "streaming_upload" and self._weight_update_mode() == "delta":
+            return weights_path / "delta.safetensors"
+        return stable_path
 
     async def _apply_policy_update(self, next_ckpt_step: int) -> None:
         # If we're advancing to step - 1, the trainer hasn't broadcast it yet (otherwise
@@ -416,19 +423,23 @@ class Scheduler:
         base_version = str(next_ckpt_step - 1) if mode == "delta" else None
         weights_path = get_step_path(get_broadcast_dir(self.config.output_dir), next_ckpt_step)
         stable_path = weights_path / "STABLE"
+        ready_path = self._stage_ready_path(weights_path, stable_path)
 
         self.logger.info(f"Background staging waiting for checkpoint {next_ckpt_step}")
         wait_for_ckpt_start_time = time.perf_counter()
-        await wait_for_path(stable_path)
+        await wait_for_path(ready_path)
         wait_for_ckpt_time = time.perf_counter() - wait_for_ckpt_start_time
 
         stage_start_time = time.perf_counter()
+        stage_kwargs = self._stage_upload_kwargs()
+        if self._weight_stage_transport() == "streaming_upload":
+            stage_kwargs["done_path"] = stable_path
         await self.student_inference.stage_weights(
             weights_path,
             version=version,
             mode=mode,
             base_version=base_version,
-            **self._stage_upload_kwargs(),
+            **stage_kwargs,
         )
         stage_time = time.perf_counter() - stage_start_time
         self.logger.debug(

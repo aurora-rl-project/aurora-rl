@@ -12,7 +12,7 @@ gpus_per_node = 4
 type = "filesystem"
 mode = "delta"
 update_protocol = "stage_commit"
-stage_transport = "chunked_upload"
+stage_transport = "streaming_upload"
 background_stage = true
 
 [model]
@@ -49,7 +49,7 @@ name = "default"
 gpu_memory_utilization = 0.45
 
 [inference.server]
-staging_dir = "/tmp/prime-rl-delta-e2e/staging"
+staging_dir = "staging/prime-rl-delta-e2e/staging"
 
 [inference.model]
 enforce_eager = true

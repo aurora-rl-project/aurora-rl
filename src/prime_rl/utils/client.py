@@ -102,7 +102,8 @@ class InferencePool(Protocol):
         mode: str = "full",
         base_version: str | None = None,
         upload: bool = False,
-        upload_method: Literal["multipart", "chunked"] = "multipart",
+        upload_method: Literal["multipart", "chunked", "streaming"] = "multipart",
+        done_path: Path | None = None,
     ) -> None:
         """Stage weights on all inference servers."""
         ...
@@ -188,7 +189,8 @@ class StaticInferencePool:
         mode: str = "full",
         base_version: str | None = None,
         upload: bool = False,
-        upload_method: Literal["multipart", "chunked"] = "multipart",
+        upload_method: Literal["multipart", "chunked", "streaming"] = "multipart",
+        done_path: Path | None = None,
     ) -> None:
         await self._record_admin_results(
             stage_weights(
@@ -199,6 +201,7 @@ class StaticInferencePool:
                 base_version=base_version,
                 upload=upload,
                 upload_method=upload_method,
+                done_path=done_path,
             )
         )
 
@@ -520,8 +523,10 @@ async def stage_weights(
     mode: str = "full",
     base_version: str | None = None,
     upload: bool = False,
-    upload_method: Literal["multipart", "chunked"] = "multipart",
+    upload_method: Literal["multipart", "chunked", "streaming"] = "multipart",
     chunk_size_bytes: int = STAGE_UPLOAD_CHUNK_BYTES,
+    done_path: Path | None = None,
+    poll_interval_s: float = 0.1,
 ) -> list[EndpointOperationResult]:
     """Stage weights on static inference servers.
 
@@ -533,10 +538,12 @@ async def stage_weights(
     """
     if mode not in {"full", "delta"}:
         raise ValueError(f"unsupported weight update mode: {mode}")
-    if upload_method not in {"multipart", "chunked"}:
+    if upload_method not in {"multipart", "chunked", "streaming"}:
         raise ValueError(f"unsupported stage upload method: {upload_method}")
     if chunk_size_bytes <= 0:
         raise ValueError("chunk_size_bytes must be positive")
+    if poll_interval_s <= 0:
+        raise ValueError("poll_interval_s must be positive")
 
     data = {"version": version, "mode": mode}
     if base_version is not None:
@@ -601,6 +608,68 @@ async def stage_weights(
         response = await admin_client.post("/stage_finalize", data=chunk_data)
         response.raise_for_status()
 
+    async def _stage_streaming_upload(
+        admin_client: AsyncClient,
+        upload_path: Path,
+        done_path: Path | None,
+    ) -> None:
+        if mode != "delta":
+            raise ValueError("streaming upload currently supports delta mode only")
+        if done_path is None and not upload_path.exists():
+            raise FileNotFoundError(upload_path)
+
+        init_data = {
+            **data,
+            "filename": upload_path.name,
+        }
+        response = await admin_client.post("/stage_stream_init", json=init_data)
+        response.raise_for_status()
+        upload_id = response.json().get("upload_id")
+        if not upload_id:
+            raise RuntimeError("stage_stream_init response did not include upload_id")
+
+        chunk_index = 0
+        offset = 0
+        while True:
+            if upload_path.exists():
+                size = upload_path.stat().st_size
+                if size > offset:
+                    to_read = min(chunk_size_bytes, size - offset)
+                    with upload_path.open("rb") as f:
+                        f.seek(offset)
+                        chunk = f.read(to_read)
+                    if chunk:
+                        response = await admin_client.post(
+                            "/stage_stream_chunk",
+                            params={"upload_id": upload_id, "chunk_index": chunk_index, "offset": offset},
+                            content=chunk,
+                        )
+                        response.raise_for_status()
+                        offset += len(chunk)
+                        chunk_index += 1
+                        continue
+
+            if done_path is None:
+                if upload_path.exists() and offset >= upload_path.stat().st_size:
+                    break
+            elif done_path.exists():
+                final_size = upload_path.stat().st_size if upload_path.exists() else 0
+                if offset >= final_size:
+                    break
+
+            await asyncio.sleep(poll_interval_s)
+
+        if not upload_path.exists():
+            raise FileNotFoundError(upload_path)
+        final_size = upload_path.stat().st_size
+        finalize_data = {
+            "upload_id": upload_id,
+            "final_size": str(final_size),
+            "sha256": _sha256_file(upload_path),
+        }
+        response = await admin_client.post("/stage_stream_finalize", data=finalize_data)
+        response.raise_for_status()
+
     if upload:
         upload_path = _upload_path()
         if upload_method == "multipart":
@@ -609,7 +678,7 @@ async def stage_weights(
                 "stage_weights",
                 lambda admin_client: _stage_multipart_upload(admin_client, upload_path),
             )
-        else:
+        if upload_method == "chunked":
             total_size = upload_path.stat().st_size
             expected_sha256 = _sha256_file(upload_path)
             return await _run_endpoint_operations(
@@ -617,6 +686,11 @@ async def stage_weights(
                 "stage_weights",
                 lambda admin_client: _stage_chunked_upload(admin_client, upload_path, total_size, expected_sha256),
             )
+        return await _run_endpoint_operations(
+            admin_clients,
+            "stage_weights",
+            lambda admin_client: _stage_streaming_upload(admin_client, upload_path, done_path),
+        )
     return await _run_endpoint_operations(admin_clients, "stage_weights", _stage_path)
 
 
