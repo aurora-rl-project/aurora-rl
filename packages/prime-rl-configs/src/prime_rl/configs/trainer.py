@@ -470,6 +470,9 @@ class FileSystemWeightBroadcastConfig(BaseWeightBroadcastConfig):
     delta_index_encoding: Literal["optimized", "naive"] = "optimized"
     """Sparse delta index encoding used when ``mode='delta'``."""
 
+    retain_all_deltas: bool = False
+    """When ``mode='delta'``, keep every delta broadcast on disk so retired inference endpoints can replay the chain during recovery."""
+
 
 class NCCLWeightBroadcastConfig(BaseWeightBroadcastConfig):
     type: Literal["nccl"] = "nccl"

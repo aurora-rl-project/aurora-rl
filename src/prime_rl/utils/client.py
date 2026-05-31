@@ -58,6 +58,30 @@ class EndpointStats:
         self.last_duration_s = result.duration_s
 
 
+EndpointLeaseState = Literal["healthy", "quarantine", "retired", "recovering"]
+
+
+@dataclass
+class EndpointLeaseRuntime:
+    state: EndpointLeaseState = "healthy"
+    quarantine_until: float | None = None
+    quarantine_count: int = 0
+    retired_count: int = 0
+    recovery_attempt_count: int = 0
+    recovery_success_count: int = 0
+    last_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class DeltaReplayEntry:
+    weight_path: Path
+    version: str
+    base_version: str | None
+    upload: bool
+    upload_method: Literal["multipart", "chunked", "streaming"]
+    done_path: Path | None
+
+
 @runtime_checkable
 class InferencePool(Protocol):
     """Protocol for inference pools (static or elastic)."""
@@ -146,14 +170,24 @@ class StaticInferencePool:
         self._skip_model_check = client_config.skip_model_check
         self._wait_for_ready_timeout = client_config.wait_for_ready_timeout
         self._eval_cycle = cycle(self._eval_clients)
+        self._endpoint_aliases = self._build_endpoint_aliases(client_config)
         self._endpoint_stats: dict[str, dict[str, EndpointStats]] = {
             self._endpoint_key(admin_client): {} for admin_client in self._admin_clients
         }
+        self._endpoint_runtime: dict[str, EndpointLeaseRuntime] = {
+            self._endpoint_key(admin_client): EndpointLeaseRuntime() for admin_client in self._admin_clients
+        }
+        self._lease_enabled = client_config.lease_enabled
+        self._lease_cooldown_s = client_config.lease_cooldown_s
+        self._lease_recovery_enabled = client_config.lease_recovery_enabled
+        self._lease_recovery_poll_interval_s = client_config.lease_recovery_poll_interval_s
+        self._delta_replay_entries: dict[str, DeltaReplayEntry] = {}
+        self._active_version: str | None = None
         self.model_name = model_name
 
     @property
     def train_clients(self) -> list[vf.ClientConfig]:
-        return self._train_clients
+        return self._healthy_clients(self._train_clients)
 
     @property
     def admin_clients(self) -> list[AsyncClient]:
@@ -164,10 +198,15 @@ class StaticInferencePool:
 
     @property
     def eval_clients(self) -> list[vf.ClientConfig]:
-        return self._eval_clients
+        return self._healthy_clients(self._eval_clients)
 
     async def get_eval_client(self) -> vf.ClientConfig:
-        return next(self._eval_cycle)
+        while True:
+            for _ in range(len(self._eval_clients)):
+                client = next(self._eval_cycle)
+                if self._client_is_healthy(client):
+                    return client
+            await asyncio.sleep(1)
 
     async def wait_for_ready(self, model_name: str, timeout: int | None = None) -> None:
         await check_health(
@@ -179,7 +218,14 @@ class StaticInferencePool:
         self, weight_dir: Path | None, lora_name: str | None = None, step: int = 0, mode: str = "full"
     ) -> None:
         await self._record_admin_results(
-            update_weights(self._admin_clients, weight_dir, lora_name=lora_name, step=step, mode=mode)
+            update_weights(
+                self._healthy_admin_clients("update_weights"),
+                weight_dir,
+                lora_name=lora_name,
+                step=step,
+                mode=mode,
+            ),
+            allow_partial=self._lease_enabled,
         )
 
     async def stage_weights(
@@ -194,7 +240,7 @@ class StaticInferencePool:
     ) -> None:
         await self._record_admin_results(
             stage_weights(
-                self._admin_clients,
+                self._healthy_admin_clients("stage_weights"),
                 weight_path,
                 version=version,
                 mode=mode,
@@ -202,19 +248,57 @@ class StaticInferencePool:
                 upload=upload,
                 upload_method=upload_method,
                 done_path=done_path,
-            )
+            ),
+            allow_partial=self._lease_enabled,
+        )
+        self._remember_delta_replay_entry(
+            weight_path=weight_path,
+            version=version,
+            mode=mode,
+            base_version=base_version,
+            upload=upload,
+            upload_method=upload_method,
+            done_path=done_path,
         )
 
     async def commit_weights(self, version: str, mode: str | None = None) -> None:
-        await self._record_admin_results(commit_weights(self._admin_clients, version=version, mode=mode))
+        await self._record_admin_results(
+            commit_weights(self._healthy_admin_clients("commit_weights"), version=version, mode=mode),
+            allow_partial=self._lease_enabled,
+        )
+        self._active_version = version
+        if mode == "delta" and self._lease_recovery_enabled:
+            await self.recover_unhealthy_endpoints()
 
     async def reload_weights(self) -> None:
-        await self._record_admin_results(reload_weights(self._admin_clients))
+        await self._record_admin_results(
+            reload_weights(self._healthy_admin_clients("reload_weights")),
+            allow_partial=self._lease_enabled,
+        )
+
+    def quarantine_client(self, client_config: vf.ClientConfig, reason: str) -> None:
+        """Quarantine the endpoint backing a rollout client after a request-level failure."""
+        if not self._lease_enabled:
+            return
+        endpoint = self._client_endpoint_key(client_config)
+        if endpoint not in self._endpoint_runtime:
+            return
+        self._set_endpoint_state(endpoint, "quarantine", reason=reason)
 
     def get_metrics(self) -> dict[str, float]:
         metrics: dict[str, float] = {}
         for endpoint_idx, endpoint in enumerate(self._admin_clients):
-            endpoint_stats = self._endpoint_stats.get(self._endpoint_key(endpoint), {})
+            endpoint_key = self._endpoint_key(endpoint)
+            runtime = getattr(self, "_endpoint_runtime", {}).get(endpoint_key)
+            if runtime is not None:
+                state_values = {"healthy": 0.0, "quarantine": 1.0, "retired": 2.0, "recovering": 3.0}
+                metrics[f"inference_endpoint/{endpoint_idx}/state"] = state_values[runtime.state]
+                metrics[f"inference_endpoint/{endpoint_idx}/quarantine_count"] = float(runtime.quarantine_count)
+                metrics[f"inference_endpoint/{endpoint_idx}/retired_count"] = float(runtime.retired_count)
+                metrics[f"inference_endpoint/{endpoint_idx}/recovery_attempts"] = float(runtime.recovery_attempt_count)
+                metrics[f"inference_endpoint/{endpoint_idx}/recovery_successes"] = float(runtime.recovery_success_count)
+
+            endpoint_stats = self._endpoint_stats.get(endpoint_key, {})
             for operation, stats in endpoint_stats.items():
                 prefix = f"inference_endpoint/{endpoint_idx}/{operation}"
                 metrics[f"{prefix}/requests"] = float(stats.requests)
@@ -226,22 +310,232 @@ class StaticInferencePool:
     async def stop(self) -> None:
         pass
 
-    def _endpoint_key(self, admin_client: AsyncClient) -> str:
-        return str(admin_client.base_url)
+    def _build_endpoint_aliases(self, client_config: ClientConfig) -> dict[str, str]:
+        admin_urls = client_config.admin_base_url if client_config.admin_base_url else client_config.base_url
+        if len(client_config.base_url) != len(admin_urls):
+            return {}
+        return {
+            self._normalize_endpoint_url(base_url): self._normalize_endpoint_url(admin_url)
+            for base_url, admin_url in zip(client_config.base_url, admin_urls)
+        }
 
-    async def _record_admin_results(self, operation: Awaitable[list[EndpointOperationResult]]) -> None:
+    def _endpoint_key(self, admin_client: AsyncClient) -> str:
+        return self._normalize_endpoint_url(str(admin_client.base_url))
+
+    def _normalize_endpoint_url(self, url: str) -> str:
+        return url.rstrip("/").removesuffix("/v1")
+
+    def _client_endpoint_key(self, client_config: vf.ClientConfig) -> str:
+        endpoint = self._normalize_endpoint_url(str(client_config.api_base_url))
+        return self._endpoint_aliases.get(endpoint, endpoint)
+
+    def _client_is_healthy(self, client_config: vf.ClientConfig) -> bool:
+        if not self._lease_enabled:
+            return True
+        runtime = self._endpoint_runtime.get(self._client_endpoint_key(client_config))
+        return runtime is None or runtime.state == "healthy"
+
+    def _healthy_clients(self, clients: list[vf.ClientConfig]) -> list[vf.ClientConfig]:
+        return [client for client in clients if self._client_is_healthy(client)]
+
+    def _healthy_admin_clients(self, operation: str) -> list[AsyncClient]:
+        if not self._lease_enabled:
+            return self._admin_clients
+
+        selected_clients = []
+        skipped_endpoints = []
+        for admin_client in self._admin_clients:
+            endpoint = self._endpoint_key(admin_client)
+            runtime = self._endpoint_runtime.setdefault(endpoint, EndpointLeaseRuntime())
+            if runtime.state == "healthy":
+                selected_clients.append(admin_client)
+                continue
+
+            skipped_endpoints.append(f"{endpoint}({runtime.state})")
+            if runtime.state == "quarantine":
+                self._set_endpoint_state(
+                    endpoint,
+                    "retired",
+                    reason=f"missed {operation}; delta catch-up is required before reuse",
+                )
+
+        if skipped_endpoints:
+            get_logger().warning(
+                f"[weights/{operation}] skipping non-healthy endpoints: {', '.join(skipped_endpoints)}"
+            )
+        if not selected_clients:
+            raise RuntimeError(f"No healthy inference endpoints are available for {operation}.")
+        return selected_clients
+
+    def _set_endpoint_state(self, endpoint: str, state: EndpointLeaseState, reason: str) -> None:
+        runtime = self._endpoint_runtime.setdefault(endpoint, EndpointLeaseRuntime())
+        previous_state = runtime.state
+        if previous_state == state and state != "retired":
+            runtime.last_reason = reason
+            return
+
+        runtime.state = state
+        runtime.last_reason = reason
+        if state == "quarantine":
+            runtime.quarantine_count += 1
+            runtime.quarantine_until = time.monotonic() + self._lease_cooldown_s
+        elif state == "retired":
+            runtime.retired_count += 1
+            runtime.quarantine_until = time.monotonic() + self._lease_cooldown_s
+        elif state == "recovering":
+            runtime.recovery_attempt_count += 1
+            runtime.quarantine_until = None
+        elif state == "healthy":
+            runtime.quarantine_until = None
+            if previous_state == "recovering":
+                runtime.recovery_success_count += 1
+
+        get_logger().warning(f"[{endpoint}] endpoint state {previous_state} -> {state}: {reason}")
+
+    def _mark_failed_endpoints_retired(self, results: list[EndpointOperationResult]) -> None:
+        if not self._lease_enabled:
+            return
+        for result in results:
+            if result.ok:
+                continue
+            self._set_endpoint_state(
+                result.endpoint,
+                "retired",
+                reason=f"{result.operation} failed: {result.error}",
+            )
+
+    async def _record_admin_results(
+        self, operation: Awaitable[list[EndpointOperationResult]], *, allow_partial: bool = False
+    ) -> list[EndpointOperationResult]:
         try:
             results = await operation
         except EndpointOperationError as exc:
             self._record_endpoint_results(exc.results)
+            self._mark_failed_endpoints_retired(exc.results)
+            if allow_partial and any(result.ok for result in exc.results):
+                get_logger().warning(f"Ignoring partial inference endpoint failure during {exc.operation}: {exc}")
+                return exc.results
             raise
         self._record_endpoint_results(results)
+        return results
 
     def _record_endpoint_results(self, results: list[EndpointOperationResult]) -> None:
         for result in results:
             endpoint_stats = self._endpoint_stats.setdefault(result.endpoint, {})
             operation_stats = endpoint_stats.setdefault(result.operation, EndpointStats())
             operation_stats.record(result)
+
+    def _remember_delta_replay_entry(
+        self,
+        *,
+        weight_path: Path,
+        version: str,
+        mode: str,
+        base_version: str | None,
+        upload: bool,
+        upload_method: Literal["multipart", "chunked", "streaming"],
+        done_path: Path | None,
+    ) -> None:
+        if mode != "delta":
+            return
+        self._delta_replay_entries[version] = DeltaReplayEntry(
+            weight_path=weight_path,
+            version=version,
+            base_version=base_version,
+            upload=upload,
+            upload_method=upload_method,
+            done_path=done_path,
+        )
+
+    async def recover_unhealthy_endpoints(self) -> None:
+        if not self._lease_recovery_enabled or self._active_version is None:
+            return
+
+        now = time.monotonic()
+        for admin_client in self._admin_clients:
+            endpoint = self._endpoint_key(admin_client)
+            runtime = self._endpoint_runtime.setdefault(endpoint, EndpointLeaseRuntime())
+            if runtime.state not in {"quarantine", "retired"}:
+                continue
+            if runtime.quarantine_until is not None and now < runtime.quarantine_until:
+                continue
+            if not await self._endpoint_health_check(admin_client):
+                continue
+
+            if runtime.state == "quarantine":
+                self._set_endpoint_state(endpoint, "healthy", reason="health check succeeded after quarantine")
+                continue
+
+            await self._recover_retired_endpoint(admin_client)
+
+    async def _endpoint_health_check(self, admin_client: AsyncClient) -> bool:
+        try:
+            response = await admin_client.get("/health", timeout=self._lease_recovery_poll_interval_s)
+            if response.status_code != 404:
+                response.raise_for_status()
+        except Exception:
+            return False
+        return True
+
+    async def _recover_retired_endpoint(self, admin_client: AsyncClient) -> None:
+        endpoint = self._endpoint_key(admin_client)
+        self._set_endpoint_state(endpoint, "recovering", reason="starting delta replay recovery")
+        try:
+            await self._record_admin_results(reload_weights([admin_client]))
+            for entry in self._delta_replay_plan():
+                get_logger().info(f"[{endpoint}] replaying delta version {entry.version}")
+                await self._record_admin_results(
+                    stage_weights(
+                        [admin_client],
+                        entry.weight_path,
+                        version=entry.version,
+                        mode="delta",
+                        base_version=entry.base_version,
+                        upload=entry.upload,
+                        upload_method=entry.upload_method,
+                        done_path=entry.done_path,
+                    )
+                )
+                await self._record_admin_results(commit_weights([admin_client], version=entry.version, mode="delta"))
+        except Exception as exc:
+            self._set_endpoint_state(endpoint, "retired", reason=f"delta replay recovery failed: {exc}")
+            return
+        self._set_endpoint_state(endpoint, "healthy", reason=f"replayed delta chain to version {self._active_version}")
+
+    def _delta_replay_plan(self) -> list[DeltaReplayEntry]:
+        if self._active_version is None:
+            return []
+        active_version = self._parse_version(self._active_version)
+        if active_version is None:
+            raise RuntimeError(f"delta recovery requires numeric versions, got {self._active_version!r}")
+
+        entries = sorted(
+            self._delta_replay_entries.values(), key=lambda entry: self._parse_version(entry.version) or -1
+        )
+        plan = []
+        expected_version = 1
+        for entry in entries:
+            entry_version = self._parse_version(entry.version)
+            if entry_version is None:
+                raise RuntimeError(f"delta recovery requires numeric versions, got {entry.version!r}")
+            if entry_version > active_version:
+                continue
+            if entry_version != expected_version:
+                raise RuntimeError(
+                    f"missing delta replay entry for version {expected_version}; cannot recover to {active_version}"
+                )
+            plan.append(entry)
+            expected_version += 1
+
+        if expected_version <= active_version:
+            raise RuntimeError(f"missing delta replay entry for version {expected_version}")
+        return plan
+
+    def _parse_version(self, version: str) -> int | None:
+        try:
+            return int(version)
+        except ValueError:
+            return None
 
 
 async def setup_inference_pool(
@@ -444,11 +738,7 @@ async def _pause_engines(admin_clients: list[AsyncClient]) -> None:
     logger = get_logger()
     logger.info("Pausing inference engines for weight update")
 
-    async def _pause(client: AsyncClient) -> None:
-        response = await client.post("/pause", params={"mode": "keep", "clear_cache": "false"})
-        response.raise_for_status()
-
-    await asyncio.gather(*[_pause(client) for client in admin_clients])
+    await asyncio.gather(*[_pause_engine(client) for client in admin_clients])
     logger.info("All inference engines paused")
 
 
@@ -456,12 +746,18 @@ async def _resume_engines(admin_clients: list[AsyncClient]) -> None:
     """Resume all inference engines after weight update."""
     logger = get_logger()
 
-    async def _resume(client: AsyncClient) -> None:
-        response = await client.post("/resume")
-        response.raise_for_status()
-
-    await asyncio.gather(*[_resume(client) for client in admin_clients])
+    await asyncio.gather(*[_resume_engine(client) for client in admin_clients])
     logger.info("All inference engines resumed")
+
+
+async def _pause_engine(client: AsyncClient) -> None:
+    response = await client.post("/pause", params={"mode": "keep", "clear_cache": "false"})
+    response.raise_for_status()
+
+
+async def _resume_engine(client: AsyncClient) -> None:
+    response = await client.post("/resume")
+    response.raise_for_status()
 
 
 async def update_weights(
@@ -706,11 +1002,14 @@ async def commit_weights(
         response = await admin_client.post("/commit", data=data)
         response.raise_for_status()
 
-    await _pause_engines(admin_clients)
-    try:
-        return await _run_endpoint_operations(admin_clients, "commit_weights", _commit)
-    finally:
-        await _resume_engines(admin_clients)
+    async def _commit_with_pause(admin_client: AsyncClient) -> None:
+        await _pause_engine(admin_client)
+        try:
+            await _commit(admin_client)
+        finally:
+            await _resume_engine(admin_client)
+
+    return await _run_endpoint_operations(admin_clients, "commit_weights", _commit_with_pause)
 
 
 async def reload_weights(admin_clients: list[AsyncClient]) -> list[EndpointOperationResult]:
@@ -720,11 +1019,14 @@ async def reload_weights(admin_clients: list[AsyncClient]) -> list[EndpointOpera
         response = await admin_client.post("/reload_weights")
         response.raise_for_status()
 
-    await _pause_engines(admin_clients)
-    try:
-        return await _run_endpoint_operations(admin_clients, "reload_weights", _reload)
-    finally:
-        await _resume_engines(admin_clients)
+    async def _reload_with_pause(admin_client: AsyncClient) -> None:
+        await _pause_engine(admin_client)
+        try:
+            await _reload(admin_client)
+        finally:
+            await _resume_engine(admin_client)
+
+    return await _run_endpoint_operations(admin_clients, "reload_weights", _reload_with_pause)
 
 
 def _is_retryable_lora_error(exception: BaseException) -> bool:

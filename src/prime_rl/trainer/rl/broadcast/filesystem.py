@@ -33,6 +33,7 @@ class FileSystemWeightBroadcast(WeightBroadcast):
         self.save_sharded = config.save_sharded if lora_config is None else False
         self.mode = config.mode
         self.delta_index_encoding = config.delta_index_encoding
+        self.retain_all_deltas = config.retain_all_deltas
         self.world = get_world()
         self.multi_run_manager = get_multi_run_manager()
         self.delta_manager = ModelDeltaManager() if self.mode == "delta" else None
@@ -155,8 +156,12 @@ class FileSystemWeightBroadcast(WeightBroadcast):
         base_state = self._prev_state_by_run.get(idx)
         if base_state is None:
             if self._initial_state is None:
-                raise RuntimeError("delta broadcast has no base state; initialize() must run before broadcast_weights()")
-            self.logger.warning(f"Delta base for run {idx} was not registered during initialize(); using initial weights")
+                raise RuntimeError(
+                    "delta broadcast has no base state; initialize() must run before broadcast_weights()"
+                )
+            self.logger.warning(
+                f"Delta base for run {idx} was not registered during initialize(); using initial weights"
+            )
             base_state = self._initial_state
 
         delta_path = save_dir / "delta.safetensors"
@@ -176,6 +181,9 @@ class FileSystemWeightBroadcast(WeightBroadcast):
         stable_file.touch()
 
     def maybe_clean(self, interval_to_keep: int | None):
+        if self.mode == "delta" and self.retain_all_deltas:
+            self.logger.debug("Skipping filesystem delta cleanup because retain_all_deltas=true")
+            return
         for idx in self.multi_run_manager.used_idxs:
             maybe_clean(
                 get_broadcast_dir(self.multi_run_manager.get_run_dir(idx)),

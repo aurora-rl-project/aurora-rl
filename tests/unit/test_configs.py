@@ -11,6 +11,7 @@ from prime_rl.configs.inference import InferenceConfig
 from prime_rl.configs.orchestrator import OrchestratorConfig
 from prime_rl.configs.rl import RLConfig
 from prime_rl.configs.sft import SFTConfig
+from prime_rl.configs.shared import ClientConfig
 from prime_rl.configs.trainer import ModelConfig as TrainerModelConfig
 from prime_rl.configs.trainer import TrainerConfig
 from prime_rl.utils.config import BaseConfig, cli
@@ -233,6 +234,7 @@ def test_shared_filesystem_delta_weight_broadcast_mode_propagates():
                 "update_protocol": "stage_commit",
                 "stage_transport": "streaming_upload",
                 "background_stage": True,
+                "retain_all_deltas": True,
             },
             "trainer": {},
             "orchestrator": {"renderer": None},
@@ -247,6 +249,59 @@ def test_shared_filesystem_delta_weight_broadcast_mode_propagates():
     assert config.orchestrator.weight_broadcast.update_protocol == "stage_commit"
     assert config.orchestrator.weight_broadcast.stage_transport == "streaming_upload"
     assert config.orchestrator.weight_broadcast.background_stage is True
+    assert config.trainer.weight_broadcast.retain_all_deltas is True
+
+
+def test_client_lease_recovery_requires_lease_enabled():
+    with pytest.raises(ValidationError, match="lease recovery requires client.lease_enabled=true"):
+        ClientConfig(lease_recovery_enabled=True)
+
+
+def test_lease_recovery_requires_delta_retention():
+    with pytest.raises(ValidationError, match="retain_all_deltas=true"):
+        RLConfig.model_validate(
+            {
+                "weight_broadcast": {
+                    "type": "filesystem",
+                    "mode": "delta",
+                    "update_protocol": "stage_commit",
+                    "stage_transport": "streaming_upload",
+                },
+                "trainer": {},
+                "orchestrator": {
+                    "renderer": None,
+                    "client": {
+                        "lease_enabled": True,
+                        "lease_recovery_enabled": True,
+                    },
+                },
+                "inference": {},
+            }
+        )
+
+
+def test_lease_recovery_requires_http_stage_transport():
+    with pytest.raises(ValidationError, match="HTTP stage transport"):
+        RLConfig.model_validate(
+            {
+                "weight_broadcast": {
+                    "type": "filesystem",
+                    "mode": "delta",
+                    "update_protocol": "stage_commit",
+                    "stage_transport": "shared_fs",
+                    "retain_all_deltas": True,
+                },
+                "trainer": {},
+                "orchestrator": {
+                    "renderer": None,
+                    "client": {
+                        "lease_enabled": True,
+                        "lease_recovery_enabled": True,
+                    },
+                },
+                "inference": {},
+            }
+        )
 
 
 def test_shared_tokenizer_propagates_when_subconfigs_unset():

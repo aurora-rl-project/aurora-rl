@@ -129,11 +129,29 @@ class ClientConfig(BaseConfig):
     admin_base_url: list[str] | None = None
     """Separate base URLs for admin operations (weight updates, health checks). When set, admin clients bypass routers and hit each server directly — used in disaggregated P/D deployments where the router must not handle admin traffic."""
 
+    lease_enabled: bool = False
+    """Enable static endpoint lease state. Non-healthy endpoints are skipped for rollout/eval routing and weight sync."""
+
+    lease_cooldown_s: float = Field(20.0, ge=0.0)
+    """Seconds before a quarantined or retired static endpoint is eligible for recovery probing."""
+
+    lease_recovery_enabled: bool = False
+    """Enable static endpoint recovery by reloading base weights and replaying retained delta updates."""
+
+    lease_recovery_poll_interval_s: float = Field(5.0, gt=0.0)
+    """Timeout/interval used for static endpoint recovery health probes."""
+
     elastic: ElasticConfig | None = None
     """Elastic inference pool config for DNS-based service discovery. When set, ``base_url`` is ignored and inference servers are discovered dynamically via DNS."""
 
     router_url: str | None = None
     """vllm-router URL for load-aware inference routing. With elastic mode, inference requests go through the router while admin ops still hit discovered pods directly."""
+
+    @model_validator(mode="after")
+    def validate_lease_recovery(self):
+        if self.lease_recovery_enabled and not self.lease_enabled:
+            raise ValueError("lease recovery requires client.lease_enabled=true.")
+        return self
 
     @property
     def is_elastic(self) -> bool:

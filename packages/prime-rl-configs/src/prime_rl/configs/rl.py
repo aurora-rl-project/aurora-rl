@@ -127,6 +127,9 @@ class SharedWeightBroadcastConfig(BaseConfig):
     background_stage: bool = False
     """When using filesystem stage_commit, stage new versions in the background before commit."""
 
+    retain_all_deltas: bool = False
+    """When using filesystem delta mode, keep every delta broadcast so lease recovery can replay the full chain."""
+
     port: int = 29501
     """Port for NCCL weight broadcast."""
 
@@ -332,7 +335,10 @@ class RLConfig(BaseConfig):
                     quantize_in_weight_transfer=self.weight_broadcast.quantize_in_weight_transfer,
                 )
             elif self.weight_broadcast.type == "filesystem":
-                self.trainer.weight_broadcast = TrainerFileSystemWeightBroadcastConfig(mode=self.weight_broadcast.mode)
+                self.trainer.weight_broadcast = TrainerFileSystemWeightBroadcastConfig(
+                    mode=self.weight_broadcast.mode,
+                    retain_all_deltas=self.weight_broadcast.retain_all_deltas,
+                )
                 self.orchestrator.weight_broadcast = OrchestratorFileSystemWeightBroadcastConfig(
                     mode=self.weight_broadcast.mode,
                     update_protocol=self.weight_broadcast.update_protocol,
@@ -344,6 +350,31 @@ class RLConfig(BaseConfig):
 
         validate_shared_weight_broadcast(self.trainer, self.orchestrator, self.inference)
 
+        return self
+
+    @model_validator(mode="after")
+    def validate_lease_recovery(self):
+        client = self.orchestrator.student.client
+        if not client.lease_recovery_enabled:
+            return self
+
+        trainer_weight_broadcast = self.trainer.weight_broadcast
+        orchestrator_weight_broadcast = self.orchestrator.weight_broadcast
+        if trainer_weight_broadcast.type != "filesystem" or orchestrator_weight_broadcast.type != "filesystem":
+            raise ValueError("lease recovery requires filesystem weight broadcast.")
+        if trainer_weight_broadcast.mode != "delta" or orchestrator_weight_broadcast.mode != "delta":
+            raise ValueError("lease recovery requires weight_broadcast.mode='delta'.")
+        if orchestrator_weight_broadcast.update_protocol != "stage_commit":
+            raise ValueError("lease recovery requires weight_broadcast.update_protocol='stage_commit'.")
+        if orchestrator_weight_broadcast.stage_transport == "shared_fs":
+            raise ValueError("lease recovery requires HTTP stage transport.")
+        if not trainer_weight_broadcast.retain_all_deltas:
+            raise ValueError("lease recovery requires weight_broadcast.retain_all_deltas=true.")
+        resume_step = self.trainer.ckpt.resume_step if self.trainer.ckpt else None
+        if resume_step not in (None, 0):
+            raise ValueError(
+                "lease recovery only supports training from the base model (resume_step must be None or 0)."
+            )
         return self
 
     @model_validator(mode="after")

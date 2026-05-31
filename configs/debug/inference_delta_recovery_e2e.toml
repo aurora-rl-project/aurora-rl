@@ -1,0 +1,13 @@
+gpu_memory_utilization = 0.45
+
+[model]
+name = "Qwen/Qwen3-0.6B"
+enforce_eager = true
+
+[server]
+host = "127.0.0.1"
+port = 8001
+staging_dir = "staging/prime-rl-delta-recovery-e2e/inference-a"
+
+[weight_broadcast]
+type = "filesystem"

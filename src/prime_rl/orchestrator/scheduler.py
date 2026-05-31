@@ -482,8 +482,7 @@ class Scheduler:
         self.stage_weights_time = staged_policy.stage_time
         self.update_weights_time = time.perf_counter() - update_weights_start_time
         self.logger.debug(
-            f"Committed background-staged weights for step {staged_policy.step} in "
-            f"{self.commit_weights_time:.2f}s"
+            f"Committed background-staged weights for step {staged_policy.step} in {self.commit_weights_time:.2f}s"
         )
 
         self.ckpt_step = staged_policy.step
@@ -678,6 +677,9 @@ class Scheduler:
                         await self.drop_group(group_id)
                     continue
                 except Exception as e:
+                    quarantine_client = getattr(self.rollout_inference, "quarantine_client", None)
+                    if quarantine_client is not None:
+                        quarantine_client(rollout_info.client_config, reason=str(e))
                     self.logger.warning(f"Rollout failed: {e}")
                     if group_id is not None:
                         await self.drop_group(group_id)
