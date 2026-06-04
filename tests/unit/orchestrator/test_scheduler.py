@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import verifiers as vf
 
-from prime_rl.orchestrator.scheduler import GroupState, InflightRequest, Scheduler
+from prime_rl.orchestrator.scheduler import GroupState, InflightRequest, RolloutClientStats, Scheduler
 from prime_rl.utils.async_utils import safe_cancel
 
 
@@ -13,7 +13,11 @@ def make_scheduler() -> Scheduler:
     scheduler = Scheduler.__new__(Scheduler)
     scheduler.step = 9
     scheduler.ckpt_step = 7
-    scheduler.config = SimpleNamespace(output_dir=Path("/tmp/prime-rl-test"))
+    scheduler.config = SimpleNamespace(
+        output_dir=Path("/tmp/prime-rl-test"),
+        enable_load_balancing=False,
+        throughput_ema_beta=0.8,
+    )
     scheduler.logger = MagicMock()
     scheduler.checkpoint_ready = asyncio.Event()
     scheduler.checkpoint_ready.set()
@@ -33,6 +37,14 @@ def make_scheduler() -> Scheduler:
     scheduler.inflight_stage_step = None
     scheduler.update_policy_task = None
     scheduler.rate_limiter = None
+    scheduler.empty_rollouts_by_env = {}
+    scheduler.errored_rollouts_by_env = {}
+    scheduler.errors_by_type = {}
+    scheduler.total_rollouts_by_env = {}
+    scheduler.dropped_groups_by_env = {}
+    scheduler.enable_load_balancing = False
+    scheduler.throughput_ema_beta = 0.8
+    scheduler._rollout_client_stats = {}
     return scheduler
 
 
@@ -395,6 +407,79 @@ def test_client_identity_distinguishes_base_url_and_dp_rank():
     )
 
     assert Scheduler._client_identity(client_a) != Scheduler._client_identity(client_b)
+
+
+def test_load_balancing_prefers_higher_capacity_client_at_equal_inflight_count():
+    async def run() -> None:
+        scheduler = make_scheduler()
+        scheduler.enable_load_balancing = True
+        fast = vf.ClientConfig(client_idx=0, api_base_url="http://fast/v1", extra_headers={})
+        slow = vf.ClientConfig(client_idx=1, api_base_url="http://slow/v1", extra_headers={})
+        scheduler.rollout_inference = SimpleNamespace(train_clients=[slow, fast])
+        scheduler._rollout_client_stats[Scheduler._client_identity(fast)] = RolloutClientStats(throughput_ema=100.0)
+        scheduler._rollout_client_stats[Scheduler._client_identity(slow)] = RolloutClientStats(throughput_ema=10.0)
+
+        fast_task = asyncio.create_task(asyncio.sleep(60))
+        slow_task = asyncio.create_task(asyncio.sleep(60))
+        scheduler.inflight_requests = {
+            fast_task: InflightRequest(off_policy_steps=0, client_config=fast, env_name="test"),
+            slow_task: InflightRequest(off_policy_steps=0, client_config=slow, env_name="test"),
+        }
+
+        try:
+            assert await scheduler._select_least_loaded_client() is fast
+        finally:
+            for task in (fast_task, slow_task):
+                task.cancel()
+            await asyncio.sleep(0)
+
+    asyncio.run(run())
+
+
+def test_rollout_client_metrics_track_throughput_ema_and_reset_step_window():
+    scheduler = make_scheduler()
+    scheduler.enable_load_balancing = True
+    client = vf.ClientConfig(client_idx=0, api_base_url="http://worker/v1", extra_headers={})
+    scheduler.rollout_inference = SimpleNamespace(train_clients=[client], get_metrics=lambda: {})
+    rollout = vf.RolloutOutput(
+        env_name="test",
+        error=None,
+        info={},
+        metrics={},
+        reward=1.0,
+        state={},
+        trajectory=[
+            {
+                "tokens": {
+                    "prompt_ids": [1, 2],
+                    "completion_ids": [3, 4, 5],
+                },
+                "response": {},
+            }
+        ],
+    )
+
+    scheduler._record_rollout_client_result(
+        client,
+        duration_s=2.0,
+        rollouts=[rollout],
+        error=False,
+    )
+
+    metrics = scheduler.get_metrics()
+
+    assert metrics["scheduler/load_balancing_enabled"] == 1.0
+    assert metrics["rollout_client/0/requests"] == 1.0
+    assert metrics["rollout_client/0/tokens"] == 5.0
+    assert metrics["rollout_client/0/last_throughput"] == 2.5
+    assert metrics["rollout_client/0/throughput_ema"] == 2.5
+    assert metrics["rollout_client/0/routing_weight"] == 1.0
+
+    next_metrics = scheduler.get_metrics()
+
+    assert next_metrics["rollout_client/0/requests"] == 0.0
+    assert next_metrics["rollout_client/0/tokens"] == 0.0
+    assert next_metrics["rollout_client/0/throughput_ema"] == 2.5
 
 
 def test_lora_policy_update_in_sft_keeps_teacher_model_name():

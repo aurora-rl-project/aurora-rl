@@ -633,6 +633,12 @@ class OrchestratorConfig(BaseConfig):
     inference_metrics_roles: list[Literal["prefill", "decode"]] | None = None
     """Role for each student admin client when collecting P/D inference metrics."""
 
+    enable_load_balancing: bool = False
+    """Route rollout requests with observed per-client throughput weights. When false, the scheduler uses uniform least-loaded routing."""
+
+    throughput_ema_beta: float = Field(0.8, ge=0.0, le=1.0)
+    """Smoothing factor for per-client rollout throughput EMA used by load balancing. Higher values are smoother."""
+
     ckpt: CheckpointConfig | None = None
     """Checkpoint configuration."""
 

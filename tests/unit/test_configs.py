@@ -276,6 +276,27 @@ def test_inference_relay_config_translates_to_vllm_namespace():
     assert namespace.relay_reload_timeout_s == 40.0
 
 
+def test_orchestrator_load_balancing_config_defaults_and_overrides():
+    default_config = OrchestratorConfig.model_validate({"renderer": None})
+
+    assert default_config.enable_load_balancing is False
+    assert default_config.throughput_ema_beta == 0.8
+
+    config = OrchestratorConfig.model_validate(
+        {
+            "renderer": None,
+            "enable_load_balancing": True,
+            "throughput_ema_beta": 0.25,
+        }
+    )
+
+    assert config.enable_load_balancing is True
+    assert config.throughput_ema_beta == 0.25
+
+    with pytest.raises(ValidationError):
+        OrchestratorConfig.model_validate({"renderer": None, "throughput_ema_beta": 1.5})
+
+
 def test_client_lease_recovery_requires_lease_enabled():
     with pytest.raises(ValidationError, match="lease recovery requires client.lease_enabled=true"):
         ClientConfig(lease_recovery_enabled=True)

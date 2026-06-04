@@ -32,6 +32,40 @@ class InflightRequest:
     env_name: str
     group_id: int | None = None
     rollout_count: int = 1
+    start_time: float = field(default_factory=time.perf_counter)
+
+
+@dataclass
+class RolloutClientStats:
+    requests: int = 0
+    errors: int = 0
+    total_duration_s: float = 0.0
+    total_tokens: int = 0
+    last_duration_s: float = 0.0
+    last_tokens: int = 0
+    last_throughput: float = 0.0
+    throughput_ema: float | None = None
+
+    def record(self, *, duration_s: float, token_count: int, error: bool, ema_beta: float) -> None:
+        self.requests += 1
+        if error:
+            self.errors += 1
+        self.total_duration_s += duration_s
+        self.total_tokens += token_count
+        self.last_duration_s = duration_s
+        self.last_tokens = token_count
+        self.last_throughput = token_count / duration_s if duration_s > 0 else 0.0
+        if token_count > 0 and duration_s > 0:
+            if self.throughput_ema is None:
+                self.throughput_ema = self.last_throughput
+            else:
+                self.throughput_ema = ema_beta * self.throughput_ema + (1.0 - ema_beta) * self.last_throughput
+
+    def reset_step(self) -> None:
+        self.requests = 0
+        self.errors = 0
+        self.total_duration_s = 0.0
+        self.total_tokens = 0
 
 
 @dataclass
@@ -133,6 +167,9 @@ class Scheduler:
         self.total_rollouts_by_env: dict[str, int] = defaultdict(int)
         self.dropped_groups_by_env: dict[str, int] = defaultdict(int)
         self.last_batch_generation_time = 0.0
+        self.enable_load_balancing = config.enable_load_balancing
+        self.throughput_ema_beta = config.throughput_ema_beta
+        self._rollout_client_stats: dict[tuple[str, str | None], RolloutClientStats] = {}
 
     @property
     def uses_token_batching(self) -> bool:
@@ -171,6 +208,26 @@ class Scheduler:
             c.extra_headers.get("X-data-parallel-rank"),
         )
 
+    def _default_routing_weight(self) -> float:
+        observed = [
+            stats.throughput_ema
+            for stats in self._rollout_client_stats.values()
+            if stats.throughput_ema is not None and stats.throughput_ema > 0
+        ]
+        if not observed:
+            return 1.0
+        return sum(observed) / len(observed)
+
+    def _client_routing_weight(self, client_config: vf.ClientConfig, default_weight: float | None = None) -> float:
+        if not getattr(self, "enable_load_balancing", False):
+            return 1.0
+        if default_weight is None:
+            default_weight = self._default_routing_weight()
+        stats = self._rollout_client_stats.get(self._client_identity(client_config))
+        if stats is None or stats.throughput_ema is None or stats.throughput_ema <= 0:
+            return default_weight
+        return stats.throughput_ema
+
     async def _select_least_loaded_client(self) -> vf.ClientConfig:
         """Select the client with the fewest in-flight tasks.
 
@@ -182,7 +239,36 @@ class Scheduler:
             await asyncio.sleep(1)
             clients = self.rollout_inference.train_clients
         inflight = Counter(self._client_identity(info.client_config) for info in self.inflight_requests.values())
-        return min(clients, key=lambda c: inflight[self._client_identity(c)])
+        default_weight = self._default_routing_weight()
+
+        def client_load_score(client_config: vf.ClientConfig) -> tuple[float, float, int]:
+            weight = max(self._client_routing_weight(client_config, default_weight), 1e-9)
+            identity = self._client_identity(client_config)
+            return (
+                inflight[identity] / weight,
+                -weight,
+                getattr(client_config, "client_idx", 0),
+            )
+
+        return min(clients, key=client_load_score)
+
+    def _record_rollout_client_result(
+        self,
+        client_config: vf.ClientConfig,
+        *,
+        duration_s: float,
+        rollouts: list[vf.RolloutOutput],
+        error: bool,
+    ) -> None:
+        stats = self._rollout_client_stats.setdefault(self._client_identity(client_config), RolloutClientStats())
+        token_count = sum(get_seq_len(rollout) for rollout in rollouts if rollout.get("error") is None)
+        rollout_error = error or any(rollout.get("error") is not None for rollout in rollouts)
+        stats.record(
+            duration_s=duration_s,
+            token_count=token_count,
+            error=rollout_error,
+            ema_beta=getattr(self, "throughput_ema_beta", 0.8),
+        )
 
     async def drop_group(self, group_id: int) -> int:
         """Drop a group and cancel any remaining in-flight rollouts for it. Returns the number of cancelled rollouts."""
@@ -606,8 +692,15 @@ class Scheduler:
                     if group is None:
                         continue
 
+                    duration_s = time.perf_counter() - rollout_info.start_time
                     result = finished_task.result()
                     rollouts: list[vf.RolloutOutput] = result if isinstance(result, list) else [result]
+                    self._record_rollout_client_result(
+                        rollout_info.client_config,
+                        duration_s=duration_s,
+                        rollouts=rollouts,
+                        error=False,
+                    )
                     self.total_rollouts_by_env[env_name] += len(rollouts)
 
                     # Partition rollouts into valid vs failed and tally per-rollout
@@ -677,6 +770,12 @@ class Scheduler:
                         await self.drop_group(group_id)
                     continue
                 except Exception as e:
+                    self._record_rollout_client_result(
+                        rollout_info.client_config,
+                        duration_s=time.perf_counter() - rollout_info.start_time,
+                        rollouts=[],
+                        error=True,
+                    )
                     quarantine_client = getattr(self.rollout_inference, "quarantine_client", None)
                     if quarantine_client is not None:
                         quarantine_client(rollout_info.client_config, reason=str(e))
@@ -731,6 +830,45 @@ class Scheduler:
     def async_level(self) -> int:
         return self.step - self.ckpt_step
 
+    def _get_rollout_client_metrics(self) -> dict[str, float]:
+        clients = getattr(self.rollout_inference, "train_clients", [])
+        metrics: dict[str, float] = {
+            "scheduler/load_balancing_enabled": 1.0 if getattr(self, "enable_load_balancing", False) else 0.0
+        }
+        if not clients:
+            return metrics
+
+        default_weight = self._default_routing_weight()
+        raw_weights = [max(self._client_routing_weight(client, default_weight), 0.0) for client in clients]
+        total_weight = sum(raw_weights)
+        summaries: list[str] = []
+        for client_idx, (client, raw_weight) in enumerate(zip(clients, raw_weights)):
+            identity = self._client_identity(client)
+            stats = self._rollout_client_stats.setdefault(identity, RolloutClientStats())
+            prefix = f"rollout_client/{client_idx}"
+            routing_weight = raw_weight / total_weight if total_weight > 0 else 1.0 / len(clients)
+            metrics[f"{prefix}/routing_weight"] = routing_weight
+            metrics[f"{prefix}/throughput_ema"] = stats.throughput_ema or 0.0
+            metrics[f"{prefix}/last_throughput"] = stats.last_throughput
+            metrics[f"{prefix}/requests"] = float(stats.requests)
+            metrics[f"{prefix}/errors"] = float(stats.errors)
+            metrics[f"{prefix}/tokens"] = float(stats.total_tokens)
+            metrics[f"{prefix}/total_duration_s"] = stats.total_duration_s
+            metrics[f"{prefix}/last_duration_s"] = stats.last_duration_s
+            metrics[f"{prefix}/last_tokens"] = float(stats.last_tokens)
+            summaries.append(
+                f"{client.api_base_url} weight={routing_weight:.3f} "
+                f"ema={stats.throughput_ema or 0.0:.2f} "
+                f"requests={stats.requests} errors={stats.errors}"
+            )
+
+        if getattr(self, "enable_load_balancing", False):
+            self.logger.debug(f"Rollout load balancing: {'; '.join(summaries)}")
+
+        for stats in self._rollout_client_stats.values():
+            stats.reset_step()
+        return metrics
+
     def get_metrics(self) -> dict[str, float]:
         total_rollouts = sum(self.total_rollouts_by_env.values())
         metrics = {
@@ -771,5 +909,6 @@ class Scheduler:
 
         # Add train pool metrics (e.g. elastic pool server counts)
         metrics.update(self.rollout_inference.get_metrics())
+        metrics.update(self._get_rollout_client_metrics())
 
         return metrics
