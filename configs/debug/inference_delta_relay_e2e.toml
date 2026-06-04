@@ -1,0 +1,17 @@
+gpu_memory_utilization = 0.22
+
+[model]
+name = "Qwen/Qwen3-0.6B"
+enforce_eager = true
+
+[server]
+host = "127.0.0.1"
+port = 8101
+staging_dir = "staging/prime-rl-delta-relay-e2e/inference"
+
+[weight_broadcast]
+type = "filesystem"
+
+[relay]
+enabled = false
+peers = []

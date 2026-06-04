@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+import httpx
 import uvloop
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
@@ -78,6 +79,411 @@ def _safe_path_component(value: str) -> str:
 
 def _error_response(status_code: int, message: str) -> JSONResponse:
     return JSONResponse({"error": message}, status_code=status_code)
+
+
+def _coerce_bool(value: Any, default: bool = True) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value != 0
+    value_str = str(value).strip().lower()
+    if value_str in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if value_str in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    return default
+
+
+def _normalize_admin_url(url: str) -> str:
+    return url.rstrip("/").removesuffix("/v1")
+
+
+def _relay_peer_url(peer: str, route: str) -> str:
+    return f"{_normalize_admin_url(peer)}/{route.lstrip('/')}"
+
+
+def _relay_requested(fields: dict[str, Any]) -> bool:
+    return _coerce_bool(fields.get("relay"), default=True)
+
+
+def _relay_peers(state: State) -> list[str]:
+    if not bool(getattr(state, "relay_enabled", False)):
+        return []
+    return list(getattr(state, "relay_peers", []) or [])
+
+
+def _relay_transport(state: State, peer: str) -> httpx.AsyncBaseTransport | None:
+    transports = getattr(state, "relay_transports", None)
+    if not transports:
+        return None
+    return transports.get(peer) or transports.get(_normalize_admin_url(peer))
+
+
+async def _relay_post(
+    state: State,
+    peer: str,
+    route: str,
+    *,
+    timeout_s: float,
+    params: dict[str, Any] | None = None,
+    data: dict[str, Any] | None = None,
+    json: dict[str, Any] | None = None,
+    files: dict[str, Any] | None = None,
+    content: bytes | None = None,
+) -> httpx.Response:
+    async with httpx.AsyncClient(timeout=timeout_s, transport=_relay_transport(state, peer)) as client:
+        response = await client.post(
+            _relay_peer_url(peer, route),
+            params=params,
+            data=data,
+            json=json,
+            files=files,
+            content=content,
+        )
+        response.raise_for_status()
+        return response
+
+
+def _relay_failure_response(state: State, operation: str, stats: dict[str, float | None]) -> JSONResponse | None:
+    if not bool(getattr(state, "relay_fail_on_peer_error", False)):
+        return None
+    failed_peers = [peer for peer, duration in stats.items() if duration is None]
+    if not failed_peers:
+        return None
+    return JSONResponse(
+        {
+            "error": f"relay {operation} failed for {len(failed_peers)} peer(s)",
+            "failed_peers": failed_peers,
+            "relay": stats,
+        },
+        status_code=502,
+    )
+
+
+async def _relay_pause_peer(state: State, peer: str, timeout_s: float) -> None:
+    await _relay_post(state, peer, "/pause", timeout_s=timeout_s, params={"mode": "keep", "clear_cache": "false"})
+
+
+async def _relay_resume_peer(state: State, peer: str, timeout_s: float) -> None:
+    await _relay_post(state, peer, "/resume", timeout_s=timeout_s)
+
+
+def _stage_relay_file(path: Path, mode: str) -> Path:
+    if path.is_file():
+        return path
+    if mode == "delta" and path.is_dir():
+        return path / "delta.safetensors"
+    return path
+
+
+async def _fan_out_stage_file(
+    state: State,
+    *,
+    path: Path,
+    version: str,
+    mode: str,
+    base_version: Any,
+    relay: bool,
+) -> dict[str, float | None]:
+    peers = _relay_peers(state)
+    if not relay or not peers:
+        return {}
+
+    upload_path = _stage_relay_file(path, mode)
+    if not upload_path.is_file():
+        logger.warning(
+            "[relay][stage] cannot fan-out %s weights version %s from non-file path %s",
+            mode,
+            version,
+            path.as_posix(),
+        )
+        return {peer: None for peer in peers}
+
+    data: dict[str, Any] = {"version": version, "mode": mode, "relay": "false"}
+    if base_version is not None:
+        data["base_version"] = str(base_version)
+
+    results: dict[str, float | None] = {}
+    logger.info("[relay][stage] fan-out start v%s (%s) peers=%s", version, mode, peers)
+
+    async def _send(peer: str) -> None:
+        start = time.perf_counter()
+        try:
+            with upload_path.open("rb") as f:
+                files = {"file": (upload_path.name, f, "application/octet-stream")}
+                await _relay_post(
+                    state,
+                    peer,
+                    "/stage",
+                    timeout_s=getattr(state, "relay_stage_timeout_s", 3600.0),
+                    data=data,
+                    files=files,
+                )
+        except Exception as exc:
+            results[peer] = None
+            logger.warning("[relay][stage] v%s -> %s failed: %s", version, peer, exc)
+            return
+        results[peer] = time.perf_counter() - start
+        logger.info("[relay][stage] v%s -> %s in %.2fs", version, peer, results[peer])
+
+    await asyncio.gather(*(_send(peer) for peer in peers))
+    return results
+
+
+async def _fan_out_stage_chunk(
+    state: State,
+    *,
+    fields: dict[str, Any],
+    filename: str,
+    chunk: bytes,
+    relay: bool,
+) -> dict[str, float | None]:
+    peers = _relay_peers(state)
+    if not relay or not peers:
+        return {}
+
+    data = {key: str(value) for key, value in fields.items() if key != "relay"}
+    data["relay"] = "false"
+    results: dict[str, float | None] = {}
+    version = str(fields.get("version", "unknown"))
+
+    async def _send(peer: str) -> None:
+        start = time.perf_counter()
+        try:
+            files = {"file": (filename, chunk, "application/octet-stream")}
+            await _relay_post(
+                state,
+                peer,
+                "/stage_chunk",
+                timeout_s=getattr(state, "relay_stage_timeout_s", 3600.0),
+                data=data,
+                files=files,
+            )
+        except Exception as exc:
+            results[peer] = None
+            logger.warning("[relay][stage_chunk] v%s -> %s failed: %s", version, peer, exc)
+            return
+        results[peer] = time.perf_counter() - start
+
+    await asyncio.gather(*(_send(peer) for peer in peers))
+    return results
+
+
+async def _fan_out_stage_finalize(
+    state: State,
+    *,
+    fields: dict[str, Any],
+    relay: bool,
+) -> dict[str, float | None]:
+    peers = _relay_peers(state)
+    if not relay or not peers:
+        return {}
+
+    data = {key: str(value) for key, value in fields.items() if key != "relay"}
+    data["relay"] = "false"
+    results: dict[str, float | None] = {}
+    version = str(fields.get("version", "unknown"))
+    logger.info("[relay][stage_finalize] fan-out start v%s peers=%s", version, peers)
+
+    async def _send(peer: str) -> None:
+        start = time.perf_counter()
+        try:
+            await _relay_post(
+                state,
+                peer,
+                "/stage_finalize",
+                timeout_s=getattr(state, "relay_stage_timeout_s", 3600.0),
+                data=data,
+            )
+        except Exception as exc:
+            results[peer] = None
+            logger.warning("[relay][stage_finalize] v%s -> %s failed: %s", version, peer, exc)
+            return
+        results[peer] = time.perf_counter() - start
+        logger.info("[relay][stage_finalize] v%s -> %s in %.2fs", version, peer, results[peer])
+
+    await asyncio.gather(*(_send(peer) for peer in peers))
+    return results
+
+
+async def _fan_out_stream_init(
+    state: State,
+    *,
+    fields: dict[str, Any],
+    filename: str,
+    relay: bool,
+) -> tuple[dict[str, str], dict[str, float | None]]:
+    peers = _relay_peers(state)
+    if not relay or not peers:
+        return {}, {}
+
+    payload = {key: value for key, value in fields.items() if key != "relay"}
+    payload["filename"] = filename
+    payload["relay"] = False
+    relay_uploads: dict[str, str] = {}
+    results: dict[str, float | None] = {}
+    version = str(fields.get("version", "unknown"))
+    logger.info("[relay][stage_stream_init] fan-out start v%s peers=%s", version, peers)
+
+    async def _send(peer: str) -> None:
+        start = time.perf_counter()
+        try:
+            response = await _relay_post(
+                state,
+                peer,
+                "/stage_stream_init",
+                timeout_s=getattr(state, "relay_stage_timeout_s", 3600.0),
+                json=payload,
+            )
+            upload_id = response.json().get("upload_id")
+            if not upload_id:
+                raise RuntimeError("stage_stream_init response did not include upload_id")
+        except Exception as exc:
+            results[peer] = None
+            logger.warning("[relay][stage_stream_init] v%s -> %s failed: %s", version, peer, exc)
+            return
+        relay_uploads[peer] = str(upload_id)
+        results[peer] = time.perf_counter() - start
+
+    await asyncio.gather(*(_send(peer) for peer in peers))
+    return relay_uploads, results
+
+
+async def _fan_out_stream_chunk(
+    state: State,
+    *,
+    upload: dict[str, Any],
+    upload_id: str,
+    offset: int,
+    chunk: bytes,
+) -> dict[str, float | None]:
+    relay_uploads = upload.get("relay_uploads") or {}
+    if not upload.get("relay_requested", True) or not relay_uploads:
+        return {}
+
+    results: dict[str, float | None] = {}
+    version = str(upload.get("version", "unknown"))
+
+    async def _send(peer: str, peer_upload_id: str) -> None:
+        start = time.perf_counter()
+        try:
+            await _relay_post(
+                state,
+                peer,
+                "/stage_stream_chunk",
+                timeout_s=getattr(state, "relay_stage_timeout_s", 3600.0),
+                params={"upload_id": peer_upload_id, "offset": offset},
+                content=chunk,
+            )
+        except Exception as exc:
+            results[peer] = None
+            logger.warning("[relay][stage_stream_chunk] v%s -> %s failed: %s", version, peer, exc)
+            return
+        results[peer] = time.perf_counter() - start
+
+    await asyncio.gather(*(_send(peer, peer_upload_id) for peer, peer_upload_id in relay_uploads.items()))
+    return results
+
+
+async def _fan_out_stream_finalize(
+    state: State,
+    *,
+    upload: dict[str, Any],
+    fields: dict[str, Any],
+) -> dict[str, float | None]:
+    relay_uploads = upload.get("relay_uploads") or {}
+    if not upload.get("relay_requested", True) or not relay_uploads:
+        return {}
+
+    data = {key: str(value) for key, value in fields.items() if key != "upload_id"}
+    results: dict[str, float | None] = {}
+    version = str(upload.get("version", "unknown"))
+    logger.info("[relay][stage_stream_finalize] fan-out start v%s peers=%s", version, list(relay_uploads))
+
+    async def _send(peer: str, peer_upload_id: str) -> None:
+        start = time.perf_counter()
+        try:
+            await _relay_post(
+                state,
+                peer,
+                "/stage_stream_finalize",
+                timeout_s=getattr(state, "relay_stage_timeout_s", 3600.0),
+                data={**data, "upload_id": peer_upload_id},
+            )
+        except Exception as exc:
+            results[peer] = None
+            logger.warning("[relay][stage_stream_finalize] v%s -> %s failed: %s", version, peer, exc)
+            return
+        results[peer] = time.perf_counter() - start
+        logger.info("[relay][stage_stream_finalize] v%s -> %s in %.2fs", version, peer, results[peer])
+
+    await asyncio.gather(*(_send(peer, peer_upload_id) for peer, peer_upload_id in relay_uploads.items()))
+    return results
+
+
+async def _fan_out_commit(
+    state: State,
+    *,
+    version: str,
+    mode: str,
+    relay: bool,
+) -> dict[str, float | None]:
+    peers = _relay_peers(state)
+    if not relay or not peers:
+        return {}
+
+    results: dict[str, float | None] = {}
+    timeout_s = getattr(state, "relay_commit_timeout_s", 600.0)
+    data = {"version": version, "mode": mode, "relay": "false"}
+    logger.info("[relay][commit] fan-out start v%s (%s) peers=%s", version, mode, peers)
+
+    async def _send(peer: str) -> None:
+        start = time.perf_counter()
+        try:
+            await _relay_pause_peer(state, peer, timeout_s)
+            try:
+                await _relay_post(state, peer, "/commit", timeout_s=timeout_s, data=data)
+            finally:
+                await _relay_resume_peer(state, peer, timeout_s)
+        except Exception as exc:
+            results[peer] = None
+            logger.warning("[relay][commit] v%s -> %s failed: %s", version, peer, exc)
+            return
+        results[peer] = time.perf_counter() - start
+        logger.info("[relay][commit] v%s -> %s in %.2fs", version, peer, results[peer])
+
+    await asyncio.gather(*(_send(peer) for peer in peers))
+    return results
+
+
+async def _fan_out_reload(state: State, *, relay: bool) -> dict[str, float | None]:
+    peers = _relay_peers(state)
+    if not relay or not peers:
+        return {}
+
+    results: dict[str, float | None] = {}
+    timeout_s = getattr(state, "relay_reload_timeout_s", 600.0)
+    logger.info("[relay][reload_weights] fan-out start peers=%s", peers)
+
+    async def _send(peer: str) -> None:
+        start = time.perf_counter()
+        try:
+            await _relay_pause_peer(state, peer, timeout_s)
+            try:
+                await _relay_post(state, peer, "/reload_weights", timeout_s=timeout_s, data={"relay": "false"})
+            finally:
+                await _relay_resume_peer(state, peer, timeout_s)
+        except Exception as exc:
+            results[peer] = None
+            logger.warning("[relay][reload_weights] -> %s failed: %s", peer, exc)
+            return
+        results[peer] = time.perf_counter() - start
+        logger.info("[relay][reload_weights] -> %s in %.2fs", peer, results[peer])
+
+    await asyncio.gather(*(_send(peer) for peer in peers))
+    return results
 
 
 async def _read_request_fields(request: Request) -> tuple[dict[str, Any], UploadFile | None]:
@@ -223,6 +629,7 @@ async def stage_weights(request: Request):
     """Stage full or delta weights on the local inference server."""
     _ensure_weight_staging_state(request.app.state)
     fields, uploaded_file = await _read_request_fields(request)
+    relay_requested = _relay_requested(fields)
     metadata = _validate_stage_metadata(request.app.state, fields)
     if isinstance(metadata, JSONResponse):
         return metadata
@@ -258,7 +665,29 @@ async def stage_weights(request: Request):
         owned,
         ingest_ms,
     )
-    return {"status": "ok", "version": version, "mode": mode, "path": staged_path.as_posix(), "ingest_ms": ingest_ms}
+    fanout_start = time.perf_counter()
+    relay_stats = await _fan_out_stage_file(
+        request.app.state,
+        path=staged_path,
+        version=version,
+        mode=mode,
+        base_version=base_version,
+        relay=relay_requested,
+    )
+    fanout_ms = (time.perf_counter() - fanout_start) * 1000
+    failure_response = _relay_failure_response(request.app.state, "stage", relay_stats)
+    if failure_response is not None:
+        return failure_response
+
+    return {
+        "status": "ok",
+        "version": version,
+        "mode": mode,
+        "path": staged_path.as_posix(),
+        "ingest_ms": ingest_ms,
+        "relay": relay_stats,
+        "fanout_ms": fanout_ms,
+    }
 
 
 @router.post("/stage_stream_init")
@@ -266,6 +695,7 @@ async def stage_stream_init(request: Request):
     """Initialize a streaming staged upload."""
     _ensure_weight_staging_state(request.app.state)
     fields, _ = await _read_request_fields(request)
+    relay_requested = _relay_requested(fields)
     metadata = _validate_stage_metadata(request.app.state, fields)
     if isinstance(metadata, JSONResponse):
         return metadata
@@ -284,6 +714,17 @@ async def stage_stream_init(request: Request):
     with temp_path.open("wb"):
         pass
 
+    relay_uploads, relay_stats = await _fan_out_stream_init(
+        request.app.state,
+        fields=fields,
+        filename=filename,
+        relay=relay_requested,
+    )
+    failure_response = _relay_failure_response(request.app.state, "stage_stream_init", relay_stats)
+    if failure_response is not None:
+        _cleanup_stage_upload(request.app.state, {"path": temp_path})
+        return failure_response
+
     request.app.state.stage_uploads[_stage_stream_upload_key(upload_id)] = {
         "path": temp_path,
         "staged_path": staged_path,
@@ -295,17 +736,18 @@ async def stage_stream_init(request: Request):
         "chunks": 0,
         "start_time": time.perf_counter(),
         "streaming": True,
+        "relay_requested": relay_requested,
+        "relay_uploads": relay_uploads,
     }
     logger.info(
-        "Initialized streaming stage for %s weights version %s "
-        "(base_version=%s active_version=%s upload_id=%s)",
+        "Initialized streaming stage for %s weights version %s (base_version=%s active_version=%s upload_id=%s)",
         mode,
         version,
         base_version,
         active_version,
         upload_id,
     )
-    return {"status": "ok", "upload_id": upload_id, "version": version, "mode": mode}
+    return {"status": "ok", "upload_id": upload_id, "version": version, "mode": mode, "relay": relay_stats}
 
 
 @router.post("/stage_stream_chunk")
@@ -337,12 +779,23 @@ async def stage_stream_chunk(request: Request):
 
     upload["ranges"] = _merge_received_range(upload["ranges"], offset, end_offset)
     upload["chunks"] += 1
+    relay_stats = await _fan_out_stream_chunk(
+        request.app.state,
+        upload=upload,
+        upload_id=str(upload_id),
+        offset=offset,
+        chunk=chunk,
+    )
+    failure_response = _relay_failure_response(request.app.state, "stage_stream_chunk", relay_stats)
+    if failure_response is not None:
+        return failure_response
     return {
         "status": "ok",
         "upload_id": upload_id,
         "version": upload["version"],
         "mode": upload["mode"],
         "received_bytes": _received_bytes(upload["ranges"]),
+        "relay": relay_stats,
     }
 
 
@@ -410,12 +863,21 @@ async def stage_stream_finalize(request: Request):
         upload["chunks"],
         ingest_ms,
     )
+    fanout_start = time.perf_counter()
+    relay_stats = await _fan_out_stream_finalize(request.app.state, upload=upload, fields=fields)
+    fanout_ms = (time.perf_counter() - fanout_start) * 1000
+    failure_response = _relay_failure_response(request.app.state, "stage_stream_finalize", relay_stats)
+    if failure_response is not None:
+        return failure_response
+
     return {
         "status": "ok",
         "version": version,
         "mode": upload["mode"],
         "path": staged_path.as_posix(),
         "ingest_ms": ingest_ms,
+        "relay": relay_stats,
+        "fanout_ms": fanout_ms,
     }
 
 
@@ -424,6 +886,7 @@ async def stage_chunk(request: Request):
     """Upload one chunk of a staged weight file to the local inference server."""
     _ensure_weight_staging_state(request.app.state)
     fields, uploaded_file = await _read_request_fields(request)
+    relay_requested = _relay_requested(fields)
     metadata = _validate_stage_metadata(request.app.state, fields)
     if isinstance(metadata, JSONResponse):
         return metadata
@@ -480,14 +943,25 @@ async def stage_chunk(request: Request):
         f.seek(offset)
         f.write(chunk)
 
-    upload["ranges"] = _merge_received_range(upload["ranges"], offset, end_offset)
+        upload["ranges"] = _merge_received_range(upload["ranges"], offset, end_offset)
     upload["chunks"] += 1
+    relay_stats = await _fan_out_stage_chunk(
+        request.app.state,
+        fields=fields,
+        filename=filename,
+        chunk=chunk,
+        relay=relay_requested,
+    )
+    failure_response = _relay_failure_response(request.app.state, "stage_chunk", relay_stats)
+    if failure_response is not None:
+        return failure_response
     return {
         "status": "ok",
         "version": version,
         "mode": mode,
         "received_bytes": _received_bytes(upload["ranges"]),
         "total_size": total_size,
+        "relay": relay_stats,
     }
 
 
@@ -496,6 +970,7 @@ async def stage_finalize(request: Request):
     """Finalize a chunked staged upload and make it available for /commit."""
     _ensure_weight_staging_state(request.app.state)
     fields, _ = await _read_request_fields(request)
+    relay_requested = _relay_requested(fields)
     metadata = _validate_stage_metadata(request.app.state, fields)
     if isinstance(metadata, JSONResponse):
         return metadata
@@ -553,7 +1028,22 @@ async def stage_finalize(request: Request):
         upload["chunks"],
         ingest_ms,
     )
-    return {"status": "ok", "version": version, "mode": mode, "path": staged_path.as_posix(), "ingest_ms": ingest_ms}
+    fanout_start = time.perf_counter()
+    relay_stats = await _fan_out_stage_finalize(request.app.state, fields=fields, relay=relay_requested)
+    fanout_ms = (time.perf_counter() - fanout_start) * 1000
+    failure_response = _relay_failure_response(request.app.state, "stage_finalize", relay_stats)
+    if failure_response is not None:
+        return failure_response
+
+    return {
+        "status": "ok",
+        "version": version,
+        "mode": mode,
+        "path": staged_path.as_posix(),
+        "ingest_ms": ingest_ms,
+        "relay": relay_stats,
+        "fanout_ms": fanout_ms,
+    }
 
 
 @router.post("/commit")
@@ -561,6 +1051,7 @@ async def commit_weights(request: Request):
     """Commit a staged full checkpoint or sparse delta."""
     _ensure_weight_staging_state(request.app.state)
     fields, _ = await _read_request_fields(request)
+    relay_requested = _relay_requested(fields)
     version = fields.get("version")
     if version is None:
         return _error_response(400, "version is required")
@@ -591,14 +1082,28 @@ async def commit_weights(request: Request):
         _cleanup_staged_file(request.app.state, old_entry)
         staged_versions.pop(staged_version, None)
 
+    fanout_start = time.perf_counter()
+    relay_stats = await _fan_out_commit(
+        request.app.state,
+        version=version,
+        mode=mode,
+        relay=relay_requested,
+    )
+    fanout_ms = (time.perf_counter() - fanout_start) * 1000
+    failure_response = _relay_failure_response(request.app.state, "commit", relay_stats)
+    if failure_response is not None:
+        return failure_response
+
     logger.info("Committed %s weights version %s from %s", mode, version, path.as_posix())
-    return {"status": "ok", "active_version": version, "mode": mode}
+    return {"status": "ok", "active_version": version, "mode": mode, "relay": relay_stats, "fanout_ms": fanout_ms}
 
 
 @router.post("/reload_weights")
 async def reload_weights(request: Request):
     """Reload the base model weights and clear local staging state."""
     _ensure_weight_staging_state(request.app.state)
+    fields, _ = await _read_request_fields(request)
+    relay_requested = _relay_requested(fields)
     await engine_client(request).collective_rpc("reload_weights")
     for entry in list(request.app.state.staged_versions.values()):
         _cleanup_staged_file(request.app.state, entry)
@@ -607,8 +1112,14 @@ async def reload_weights(request: Request):
     request.app.state.active_version = None
     request.app.state.staged_versions.clear()
     request.app.state.stage_uploads.clear()
+    fanout_start = time.perf_counter()
+    relay_stats = await _fan_out_reload(request.app.state, relay=relay_requested)
+    fanout_ms = (time.perf_counter() - fanout_start) * 1000
+    failure_response = _relay_failure_response(request.app.state, "reload_weights", relay_stats)
+    if failure_response is not None:
+        return failure_response
     logger.info("Reloaded base weights and cleared staged weight versions")
-    return {"status": "ok"}
+    return {"status": "ok", "relay": relay_stats, "fanout_ms": fanout_ms}
 
 
 @router.post("/load_lora_adapter")
@@ -673,6 +1184,14 @@ async def custom_init_app_state(
     state.stage_uploads = {}
     state.active_version = None
     state.staging_dir.mkdir(parents=True, exist_ok=True)
+    state.relay_enabled = bool(getattr(args, "relay_enabled", False))
+    state.relay_peers = list(getattr(args, "relay_peers", []) or [])
+    state.relay_fail_on_peer_error = bool(getattr(args, "relay_fail_on_peer_error", False))
+    state.relay_stage_timeout_s = float(getattr(args, "relay_stage_timeout_s", 3600.0))
+    state.relay_commit_timeout_s = float(getattr(args, "relay_commit_timeout_s", 600.0))
+    state.relay_reload_timeout_s = float(getattr(args, "relay_reload_timeout_s", 600.0))
+    if state.relay_enabled:
+        logger.info("Inference relay enabled for peers: %s", state.relay_peers)
 
     # Swap in our ServingTokens subclass for /inference/v1/generate so the
     # X-data-parallel-rank header and routed_experts response field — both

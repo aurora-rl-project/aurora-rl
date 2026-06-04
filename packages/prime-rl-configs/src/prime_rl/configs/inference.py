@@ -89,6 +89,26 @@ class WeightBroadcastConfig(BaseConfig):
     """Weight broadcast transport."""
 
 
+class RelayConfig(BaseConfig):
+    enabled: bool = False
+    """When enabled, this inference server relays staged weights and commits to ``peers``."""
+
+    peers: list[str] = []
+    """Peer inference admin base URLs for this relay seed. Use one relay seed per region, with region-local peers here."""
+
+    fail_on_peer_error: bool = False
+    """When true, relay endpoints return an error if any peer fan-out request fails."""
+
+    stage_timeout_s: float = Field(3600.0, gt=0)
+    """Timeout in seconds for relay stage fan-out requests."""
+
+    commit_timeout_s: float = Field(600.0, gt=0)
+    """Timeout in seconds for relay commit fan-out requests."""
+
+    reload_timeout_s: float = Field(600.0, gt=0)
+    """Timeout in seconds for relay reload fan-out requests."""
+
+
 class KVCacheOffloadConfig(BaseConfig):
     cpu_bytes: int = Field(1_000_000_000, gt=0)
     """CPU bytes available for KV cache offloading per worker."""
@@ -263,6 +283,9 @@ class InferenceConfig(BaseConfig):
 
     weight_broadcast: WeightBroadcastConfig = WeightBroadcastConfig()
 
+    relay: RelayConfig = RelayConfig()
+    """Inference-side relay fan-out. Orchestrator admin URLs can point only at relay seeds."""
+
     kv_cache_offload: KVCacheOffloadConfig | None = None
     """CPU KV cache offload for inference workers. Standard inference uses vLLM's ``OffloadingConnector``. Disaggregated P/D deployments combine it with NIXL through ``MultiConnector`` in the SLURM launcher."""
 
@@ -406,6 +429,12 @@ class InferenceConfig(BaseConfig):
             "enable_eplb": "enable_eplb",
             "enable_dbo": "enable_dbo",
             "seed": "seed",
+            "relay.enabled": "relay_enabled",
+            "relay.peers": "relay_peers",
+            "relay.fail_on_peer_error": "relay_fail_on_peer_error",
+            "relay.stage_timeout_s": "relay_stage_timeout_s",
+            "relay.commit_timeout_s": "relay_commit_timeout_s",
+            "relay.reload_timeout_s": "relay_reload_timeout_s",
         }
 
         for config_key, vllm_key in to_vllm.items():

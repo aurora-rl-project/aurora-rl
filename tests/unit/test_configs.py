@@ -252,6 +252,30 @@ def test_shared_filesystem_delta_weight_broadcast_mode_propagates():
     assert config.trainer.weight_broadcast.retain_all_deltas is True
 
 
+def test_inference_relay_config_translates_to_vllm_namespace():
+    config = InferenceConfig.model_validate(
+        {
+            "relay": {
+                "enabled": True,
+                "peers": ["http://region-a-peer-1:8000", "http://region-a-peer-2:8000/v1"],
+                "fail_on_peer_error": True,
+                "stage_timeout_s": 120.0,
+                "commit_timeout_s": 30.0,
+                "reload_timeout_s": 40.0,
+            }
+        }
+    )
+
+    namespace = config.to_vllm()
+
+    assert namespace.relay_enabled is True
+    assert namespace.relay_peers == ["http://region-a-peer-1:8000", "http://region-a-peer-2:8000/v1"]
+    assert namespace.relay_fail_on_peer_error is True
+    assert namespace.relay_stage_timeout_s == 120.0
+    assert namespace.relay_commit_timeout_s == 30.0
+    assert namespace.relay_reload_timeout_s == 40.0
+
+
 def test_client_lease_recovery_requires_lease_enabled():
     with pytest.raises(ValidationError, match="lease recovery requires client.lease_enabled=true"):
         ClientConfig(lease_recovery_enabled=True)
