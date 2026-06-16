@@ -1,0 +1,14 @@
+data_parallel_rpc_port = 13702
+
+[model]
+name = "Qwen/Qwen3-0.6B"
+
+[server]
+host = "127.0.0.1"
+port = 8402
+# ////////////////// PRIME-RL MIGRATION FIELD //////////////////
+staging_dir = "/dev/shm/prime-rl-full-feature-relay-e2e/inference-peer"
+# ////////////////// END PRIME-RL MIGRATION FIELD //////////////////
+
+[weight_broadcast]
+type = "filesystem"

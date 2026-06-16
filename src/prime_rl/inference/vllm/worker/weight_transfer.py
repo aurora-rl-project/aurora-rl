@@ -8,7 +8,7 @@ from vllm.config import set_current_vllm_config
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.reload import finalize_layerwise_reload, initialize_layerwise_reload
 
-from prime_rl.utils.delta import DELTA_INDEX_SUFFIX, DELTA_VALUE_SUFFIX, decode_sparse_indices
+from prime_rl.utils.delta import DELTA_INDEX_SUFFIX, DELTA_VALUE_SUFFIX, decode_sparse_indices, is_sparse_delta_store
 
 logger = init_logger("vllm.inference.vllm.worker_weight_transfer")
 
@@ -41,8 +41,11 @@ def load_sparse_delta_weights(model: Module, delta_path: str, scale_factor: floa
         idx_names = {key[: -len(DELTA_INDEX_SUFFIX)] for key in delta_keys if key.endswith(DELTA_INDEX_SUFFIX)}
         val_names = {key[: -len(DELTA_VALUE_SUFFIX)] for key in delta_keys if key.endswith(DELTA_VALUE_SUFFIX)}
 
-        if not idx_names and not val_names:
+        if not idx_names and not val_names and not is_sparse_delta_store(delta):
             raise ValueError(f"{delta_path} does not look like a sparse delta file")
+        if not idx_names and not val_names:
+            logger.info(f"Sparse delta {delta_path} has no changed tensors")
+            return
         if idx_names != val_names:
             raise ValueError(
                 f"delta index/value names mismatch: idx-only={idx_names - val_names}, val-only={val_names - idx_names}"
@@ -50,7 +53,9 @@ def load_sparse_delta_weights(model: Module, delta_path: str, scale_factor: floa
 
         missing = sorted(idx_names - set(params))
         if missing:
-            raise ValueError(f"delta contains {len(missing)} parameter(s) not present in the vLLM model: {missing[:10]}")
+            raise ValueError(
+                f"delta contains {len(missing)} parameter(s) not present in the vLLM model: {missing[:10]}"
+            )
 
         logger.info(f"Applying sparse delta from {delta_path} ({len(idx_names)} tensors)")
         for name in sorted(idx_names):

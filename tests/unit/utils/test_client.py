@@ -207,6 +207,59 @@ def test_static_pool_quarantines_rollout_client_and_skips_endpoint():
             asyncio.run(admin_client.aclose())
 
 
+def test_static_pool_maps_relay_peer_to_admin_seed_for_lease():
+    pool = StaticInferencePool(
+        ClientConfig(
+            base_url=["http://seed/v1", "http://peer/v1"],
+            admin_base_url=["http://seed"],
+            lease_enabled=True,
+            lease_cooldown_s=0.0,
+        ),
+        model_name="test-model",
+    )
+
+    try:
+        peer_client = pool.train_clients[1]
+        pool.quarantine_client(peer_client, reason="peer rollout failed")
+
+        assert pool.train_clients == []
+        assert pool.eval_clients == []
+        assert pool._endpoint_runtime["http://seed"].state == "quarantine"
+    finally:
+        for admin_client in pool.admin_clients:
+            asyncio.run(admin_client.aclose())
+
+
+def test_static_pool_groups_relay_rollout_urls_across_admin_seeds():
+    pool = StaticInferencePool(
+        ClientConfig(
+            base_url=[
+                "http://seed-a/v1",
+                "http://peer-a/v1",
+                "http://seed-b/v1",
+                "http://peer-b/v1",
+            ],
+            admin_base_url=["http://seed-a", "http://seed-b"],
+            lease_enabled=True,
+            lease_cooldown_s=0.0,
+        ),
+        model_name="test-model",
+    )
+
+    try:
+        pool.quarantine_client(pool.train_clients[3], reason="peer-b rollout failed")
+
+        assert [client.api_base_url for client in pool.train_clients] == [
+            "http://seed-a/v1",
+            "http://peer-a/v1",
+        ]
+        assert pool._endpoint_runtime["http://seed-a"].state == "healthy"
+        assert pool._endpoint_runtime["http://seed-b"].state == "quarantine"
+    finally:
+        for admin_client in pool.admin_clients:
+            asyncio.run(admin_client.aclose())
+
+
 def test_static_pool_recovers_retired_endpoint_by_replaying_delta(tmp_path):
     delta_dir = tmp_path / "step_1"
     delta_dir.mkdir()

@@ -1,0 +1,12 @@
+data_parallel_rpc_port = 13502
+
+[model]
+name = "Qwen/Qwen3-0.6B"
+
+[server]
+host = "127.0.0.1"
+port = 8202
+staging_dir = "staging/prime-rl-load-balance-e2e/inference-b"
+
+[weight_broadcast]
+type = "filesystem"

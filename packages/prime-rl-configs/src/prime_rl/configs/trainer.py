@@ -473,6 +473,12 @@ class FileSystemWeightBroadcastConfig(BaseWeightBroadcastConfig):
     retain_all_deltas: bool = False
     """When ``mode='delta'``, keep every delta broadcast on disk so retired inference endpoints can replay the chain during recovery."""
 
+    @model_validator(mode="after")
+    def validate_delta_options(self):
+        if self.retain_all_deltas and self.mode != "delta":
+            raise ValueError("retain_all_deltas requires mode='delta'.")
+        return self
+
 
 class NCCLWeightBroadcastConfig(BaseWeightBroadcastConfig):
     type: Literal["nccl"] = "nccl"

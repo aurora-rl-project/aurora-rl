@@ -15,6 +15,9 @@ from safetensors.torch import save_file
 
 DELTA_INDEX_SUFFIX = ".__idx"
 DELTA_VALUE_SUFFIX = ".__val"
+DELTA_METADATA_FORMAT_KEY = "prime_rl_delta_format"
+DELTA_METADATA_FORMAT_VALUE = "sparse_delta_v1"
+DELTA_METADATA = {DELTA_METADATA_FORMAT_KEY: DELTA_METADATA_FORMAT_VALUE}
 
 
 @dataclass(frozen=True)
@@ -370,7 +373,7 @@ def verify_sparse_delta_stores(
         raise ValueError("--base looks like a sparse delta file")
     if _looks_like_delta(target_keys):
         raise ValueError("--target looks like a sparse delta file")
-    if not _looks_like_delta(delta_keys):
+    if not _looks_like_delta(delta_keys) and not is_sparse_delta_store(delta):
         raise ValueError("--delta does not look like a sparse delta file")
 
     model_keys = _validated_model_keys(base, target, include_bias=include_bias)
@@ -380,7 +383,9 @@ def verify_sparse_delta_stores(
     idx_names = {key[: -len(DELTA_INDEX_SUFFIX)] for key in delta_keys if key.endswith(DELTA_INDEX_SUFFIX)}
     val_names = {key[: -len(DELTA_VALUE_SUFFIX)] for key in delta_keys if key.endswith(DELTA_VALUE_SUFFIX)}
     if idx_names != val_names:
-        raise ValueError(f"delta index/value names mismatch: idx-only={idx_names - val_names}, val-only={val_names - idx_names}")
+        raise ValueError(
+            f"delta index/value names mismatch: idx-only={idx_names - val_names}, val-only={val_names - idx_names}"
+        )
     if unexpected := idx_names - all_names:
         raise ValueError(f"delta has names not present in the model: {sorted(unexpected)[:10]}")
 
@@ -551,7 +556,9 @@ class ModelDeltaManager:
             if mapped.part_order is not None:
                 parts_expected.setdefault(mapped.name, mapped.parts or 0)
                 if parts_expected[mapped.name] != mapped.parts:
-                    raise ValueError(f"parts mismatch for {mapped.name}: {parts_expected[mapped.name]} vs {mapped.parts}")
+                    raise ValueError(
+                        f"parts mismatch for {mapped.name}: {parts_expected[mapped.name]} vs {mapped.parts}"
+                    )
                 part_sizes[mapped.name][mapped.part_order] = int(base_tensor.numel())
                 part_shapes[mapped.name][mapped.part_order] = base_tensor.shape
 
@@ -594,7 +601,7 @@ class ModelDeltaManager:
         for name in sorted(idx_single):
             _add_sparse_tensor(delta_tensors, name, idx_single[name], val_single[name], index_encoding=index_encoding)
 
-        save_file(delta_tensors, delta_output_path)
+        save_file(delta_tensors, delta_output_path, metadata=DELTA_METADATA)
         if not collect_stats:
             return None
 
@@ -637,7 +644,7 @@ def _add_sparse_tensor(
 def _validated_model_keys(base: TensorStore, target: TensorStore, *, include_bias: bool) -> set[str]:
     base_keys = set(base.keys())
     target_keys = set(target.keys())
-    skip_keys = collect_tied_lm_head_skip_keys(base)
+    skip_keys = collect_tied_lm_head_skip_keys(base) & collect_tied_lm_head_skip_keys(target)
     base_keys -= skip_keys
     target_keys -= skip_keys
     if not include_bias:
@@ -678,6 +685,20 @@ def _fused_offsets(part_sizes: Mapping[int, int], expected: int) -> dict[int, in
 
 def _looks_like_delta(keys: Iterable[str]) -> bool:
     return any(key.endswith(DELTA_INDEX_SUFFIX) or key.endswith(DELTA_VALUE_SUFFIX) for key in keys)
+
+
+def is_sparse_delta_store(store: TensorStore) -> bool:
+    if _looks_like_delta(store.keys()):
+        return True
+    metadata = _tensor_store_metadata(store)
+    return metadata.get(DELTA_METADATA_FORMAT_KEY) == DELTA_METADATA_FORMAT_VALUE
+
+
+def _tensor_store_metadata(store: TensorStore) -> dict[str, str]:
+    metadata = getattr(store, "metadata", None)
+    if not callable(metadata):
+        return {}
+    return metadata() or {}
 
 
 def _stats_path(delta_output_path: str | Path) -> Path:

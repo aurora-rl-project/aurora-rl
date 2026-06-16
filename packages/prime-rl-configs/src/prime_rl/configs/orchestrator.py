@@ -534,6 +534,14 @@ class FileSystemWeightBroadcastConfig(BaseConfig):
     background_stage: bool = False
     """When using ``stage_commit``, wait for STABLE and call /stage in the background before commit."""
 
+    @model_validator(mode="after")
+    def validate_stage_protocol(self):
+        if self.background_stage and self.update_protocol != "stage_commit":
+            raise ValueError("background_stage requires update_protocol='stage_commit'.")
+        if self.update_protocol == "stage_commit" and self.stage_transport != "shared_fs" and self.mode != "delta":
+            raise ValueError("HTTP stage transports currently require mode='delta'.")
+        return self
+
 
 class NCCLWeightBroadcastConfig(BaseConfig):
     type: Literal["nccl"] = "nccl"

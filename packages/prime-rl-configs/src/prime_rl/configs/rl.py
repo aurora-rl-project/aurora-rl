@@ -139,6 +139,18 @@ class SharedWeightBroadcastConfig(BaseConfig):
     quantize_in_weight_transfer: bool = False
     """Use kernel-format FP8 quantized NCCL transfer for weight updates. When disabled, uses default HF checkpoint-format transfer."""
 
+    @model_validator(mode="after")
+    def validate_filesystem_options(self):
+        if self.type != "filesystem":
+            return self
+        if self.background_stage and self.update_protocol != "stage_commit":
+            raise ValueError("background_stage requires update_protocol='stage_commit'.")
+        if self.update_protocol == "stage_commit" and self.stage_transport != "shared_fs" and self.mode != "delta":
+            raise ValueError("HTTP stage transports currently require weight_broadcast.mode='delta'.")
+        if self.retain_all_deltas and self.mode != "delta":
+            raise ValueError("retain_all_deltas requires weight_broadcast.mode='delta'.")
+        return self
+
 
 class BaseDeploymentConfig(BaseConfig):
     gpus_per_node: int = 8
@@ -375,6 +387,18 @@ class RLConfig(BaseConfig):
             raise ValueError(
                 "lease recovery only supports training from the base model (resume_step must be None or 0)."
             )
+        return self
+
+    @model_validator(mode="after")
+    def validate_static_stage_commit(self):
+        client = self.orchestrator.student.client
+        weight_broadcast = self.orchestrator.weight_broadcast
+        if (
+            client.is_elastic
+            and weight_broadcast.type == "filesystem"
+            and weight_broadcast.update_protocol == "stage_commit"
+        ):
+            raise ValueError("filesystem stage_commit weight updates require the static inference pool.")
         return self
 
     @model_validator(mode="after")

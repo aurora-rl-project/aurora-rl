@@ -7,6 +7,8 @@ from safetensors.torch import save_file
 
 from prime_rl.utils.delta import (
     DELTA_INDEX_SUFFIX,
+    DELTA_METADATA_FORMAT_KEY,
+    DELTA_METADATA_FORMAT_VALUE,
     DELTA_VALUE_SUFFIX,
     ModelDeltaManager,
     decode_sparse_indices,
@@ -62,6 +64,20 @@ def test_sparse_delta_from_state_dicts_round_trips_and_skips_bias(tmp_path) -> N
         assert f"linear.weight{DELTA_INDEX_SUFFIX}" in keys
         assert f"linear.weight{DELTA_VALUE_SUFFIX}" in keys
         assert f"linear.bias{DELTA_INDEX_SUFFIX}" not in keys
+
+
+def test_sparse_delta_from_identical_state_dicts_creates_verifiable_empty_delta(tmp_path) -> None:
+    base = {"linear.weight": torch.tensor([[1.0, 2.0], [3.0, 4.0]])}
+    target = {"linear.weight": base["linear.weight"].clone()}
+    delta_path = tmp_path / "delta.safetensors"
+
+    ModelDeltaManager().extract_sparse_delta_from_state_dicts(base, target, delta_path)
+
+    result = verify_sparse_delta_state_dicts(base, target, delta_path)
+    assert result.ok
+    with safe_open(delta_path, framework="pt", device="cpu") as delta:
+        assert list(delta.keys()) == []
+        assert delta.metadata()[DELTA_METADATA_FORMAT_KEY] == DELTA_METADATA_FORMAT_VALUE
 
 
 def test_sparse_delta_uses_fused_names_with_uneven_qkv_parts(tmp_path) -> None:
@@ -121,6 +137,28 @@ def test_tied_lm_head_is_skipped(tmp_path) -> None:
         keys = set(delta.keys())
         assert f"model.embed_tokens.weight{DELTA_INDEX_SUFFIX}" in keys
         assert f"lm_head.weight{DELTA_INDEX_SUFFIX}" not in keys
+
+
+def test_lm_head_is_not_skipped_when_target_is_untied(tmp_path) -> None:
+    embedding = torch.arange(6, dtype=torch.float32).reshape(3, 2)
+    base = {
+        "model.embed_tokens.weight": embedding,
+        "lm_head.weight": embedding.clone(),
+    }
+    target = {
+        "model.embed_tokens.weight": embedding + 1.0,
+        "lm_head.weight": embedding + 2.0,
+    }
+    delta_path = tmp_path / "delta.safetensors"
+
+    ModelDeltaManager().extract_sparse_delta_from_state_dicts(base, target, delta_path)
+
+    result = verify_sparse_delta_state_dicts(base, target, delta_path)
+    assert result.ok
+    with safe_open(delta_path, framework="pt", device="cpu") as delta:
+        keys = set(delta.keys())
+        assert f"model.embed_tokens.weight{DELTA_INDEX_SUFFIX}" in keys
+        assert f"lm_head.weight{DELTA_INDEX_SUFFIX}" in keys
 
 
 def test_extract_delta_fused_sparse_file_round_trip_and_stats(tmp_path) -> None:

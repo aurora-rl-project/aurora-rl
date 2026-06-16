@@ -151,6 +151,8 @@ class ClientConfig(BaseConfig):
     def validate_lease_recovery(self):
         if self.lease_recovery_enabled and not self.lease_enabled:
             raise ValueError("lease recovery requires client.lease_enabled=true.")
+        if self.elastic is not None and self.lease_enabled:
+            raise ValueError("client lease state is only supported by the static inference pool.")
         return self
 
     @property

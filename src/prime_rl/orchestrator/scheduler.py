@@ -428,42 +428,49 @@ class Scheduler:
         return stable_path
 
     async def _apply_policy_update(self, next_ckpt_step: int) -> None:
-        # If we're advancing to step - 1, the trainer hasn't broadcast it yet (otherwise
-        # we would've picked something newer); block until the file lands.
-        if next_ckpt_step == max(self.step - 1, 0):
-            self.logger.info(
-                f"Orchestrator paused: waiting for trainer to broadcast checkpoint {next_ckpt_step} "
-                f"(orchestrator is one step ahead). Training is progressing normally."
+        checkpoint_ready_cleared = False
+        try:
+            # If we're advancing to step - 1, the trainer hasn't broadcast it yet (otherwise
+            # we would've picked something newer); block until the file lands.
+            if next_ckpt_step == max(self.step - 1, 0):
+                self.logger.info(
+                    f"Orchestrator paused: waiting for trainer to broadcast checkpoint {next_ckpt_step} "
+                    f"(orchestrator is one step ahead). Training is progressing normally."
+                )
+                self.checkpoint_ready.clear()
+                checkpoint_ready_cleared = True
+                wait_for_ckpt_start_time = time.perf_counter()
+                await wait_for_path(get_step_path(get_broadcast_dir(self.config.output_dir), next_ckpt_step) / "STABLE")
+                self.wait_for_ckpt_time = time.perf_counter() - wait_for_ckpt_start_time
+                self.logger.info(
+                    f"Orchestrator resumed: checkpoint {next_ckpt_step} ready (after {self.wait_for_ckpt_time:.2f}s)"
+                )
+
+            self.logger.debug(
+                f"Got new policy with step {next_ckpt_step}. Updating weights and cancelling old rollout requests."
             )
-            self.checkpoint_ready.clear()
-            wait_for_ckpt_start_time = time.perf_counter()
-            await wait_for_path(get_step_path(get_broadcast_dir(self.config.output_dir), next_ckpt_step) / "STABLE")
-            self.wait_for_ckpt_time = time.perf_counter() - wait_for_ckpt_start_time
-            self.logger.info(
-                f"Orchestrator resumed: checkpoint {next_ckpt_step} ready (after {self.wait_for_ckpt_time:.2f}s)"
-            )
 
-        self.logger.debug(
-            f"Got new policy with step {next_ckpt_step}. Updating weights and cancelling old rollout requests."
-        )
+            weights_path = get_step_path(get_broadcast_dir(self.config.output_dir), next_ckpt_step)
+            update_weights_start_time = time.perf_counter()
+            await self._update_inference_weights(weights_path, next_ckpt_step)
+            self.update_weights_time = time.perf_counter() - update_weights_start_time
+            self.logger.debug(f"Updated weights to step {next_ckpt_step} in {self.update_weights_time:.2f}s")
 
-        weights_path = get_step_path(get_broadcast_dir(self.config.output_dir), next_ckpt_step)
-        update_weights_start_time = time.perf_counter()
-        await self._update_inference_weights(weights_path, next_ckpt_step)
-        self.update_weights_time = time.perf_counter() - update_weights_start_time
-        self.logger.debug(f"Updated weights to step {next_ckpt_step} in {self.update_weights_time:.2f}s")
+            self.ckpt_step = next_ckpt_step
+            if self.lora_name is not None:
+                self.student_inference.update_model_name(self.lora_name)
+                # Only redirect rollout requests to the new LoRA when rollouts come from
+                # student inference (rl/opd). In sft, rollouts go to the teacher and
+                # the student's LoRA name is irrelevant to them.
+                if self.rollout_inference is self.student_inference:
+                    self.model_name = self.lora_name
 
-        self.ckpt_step = next_ckpt_step
-        if self.lora_name is not None:
-            self.student_inference.update_model_name(self.lora_name)
-            # Only redirect rollout requests to the new LoRA when rollouts come from
-            # student inference (rl/opd). In sft, rollouts go to the teacher and
-            # the student's LoRA name is irrelevant to them.
-            if self.rollout_inference is self.student_inference:
-                self.model_name = self.lora_name
-
-        self.checkpoint_ready.set()
-        await self._update_off_policy()
+            self.checkpoint_ready.set()
+            await self._update_off_policy()
+        except Exception:
+            if checkpoint_ready_cleared:
+                self.checkpoint_ready.set()
+            raise
 
     async def _update_inference_weights(self, weights_path, next_ckpt_step: int) -> None:
         mode = self._weight_update_mode()
@@ -559,28 +566,34 @@ class Scheduler:
             self.logger.info("Orchestrator paused: waiting for background stage to finish")
         self.checkpoint_ready.clear()
         update_weights_start_time = time.perf_counter()
-        staged_policy = await stage_task
+        try:
+            staged_policy = await stage_task
 
-        commit_start_time = time.perf_counter()
-        await self.student_inference.commit_weights(version=str(staged_policy.step), mode=staged_policy.mode)
-        self.commit_weights_time = time.perf_counter() - commit_start_time
-        self.wait_for_ckpt_time = staged_policy.wait_for_ckpt_time
-        self.stage_weights_time = staged_policy.stage_time
-        self.update_weights_time = time.perf_counter() - update_weights_start_time
-        self.logger.debug(
-            f"Committed background-staged weights for step {staged_policy.step} in {self.commit_weights_time:.2f}s"
-        )
+            commit_start_time = time.perf_counter()
+            await self.student_inference.commit_weights(version=str(staged_policy.step), mode=staged_policy.mode)
+            self.commit_weights_time = time.perf_counter() - commit_start_time
+            self.wait_for_ckpt_time = staged_policy.wait_for_ckpt_time
+            self.stage_weights_time = staged_policy.stage_time
+            self.update_weights_time = time.perf_counter() - update_weights_start_time
+            self.logger.debug(
+                f"Committed background-staged weights for step {staged_policy.step} in {self.commit_weights_time:.2f}s"
+            )
 
-        self.ckpt_step = staged_policy.step
-        if self.lora_name is not None:
-            self.student_inference.update_model_name(self.lora_name)
-            if self.rollout_inference is self.student_inference:
-                self.model_name = self.lora_name
+            self.ckpt_step = staged_policy.step
+            if self.lora_name is not None:
+                self.student_inference.update_model_name(self.lora_name)
+                if self.rollout_inference is self.student_inference:
+                    self.model_name = self.lora_name
 
-        self.inflight_stage_task = None
-        self.inflight_stage_step = None
-        self.checkpoint_ready.set()
-        await self._update_off_policy()
+            self.checkpoint_ready.set()
+            await self._update_off_policy()
+        except Exception:
+            self.checkpoint_ready.set()
+            raise
+        finally:
+            if self.inflight_stage_task is stage_task:
+                self.inflight_stage_task = None
+                self.inflight_stage_step = None
 
     async def _get_or_start_policy_update_task(self, next_ckpt_step: int) -> asyncio.Task:
         async with self.policy_update_lock:

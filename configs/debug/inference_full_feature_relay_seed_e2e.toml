@@ -1,0 +1,24 @@
+data_parallel_rpc_port = 13701
+
+[model]
+name = "Qwen/Qwen3-0.6B"
+
+[server]
+host = "127.0.0.1"
+port = 8401
+# ////////////////// PRIME-RL MIGRATION FIELD //////////////////
+staging_dir = "/dev/shm/prime-rl-full-feature-relay-e2e/inference-seed"
+# ////////////////// END PRIME-RL MIGRATION FIELD //////////////////
+
+[weight_broadcast]
+type = "filesystem"
+
+# ////////////////// PRIME-RL MIGRATION FIELDS //////////////////
+[relay]
+enabled = true
+peers = ["http://127.0.0.1:8402"]
+fail_on_peer_error = true
+stage_timeout_s = 3600.0  # seconds
+commit_timeout_s = 600.0  # seconds
+reload_timeout_s = 600.0  # seconds
+# ////////////////// END PRIME-RL MIGRATION FIELDS //////////////////

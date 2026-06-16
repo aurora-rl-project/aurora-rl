@@ -184,6 +184,7 @@ class StaticInferencePool:
         self._delta_replay_entries: dict[str, DeltaReplayEntry] = {}
         self._active_version: str | None = None
         self.model_name = model_name
+        self._log_grouped_admin_aliases(client_config)
 
     @property
     def train_clients(self) -> list[vf.ClientConfig]:
@@ -312,12 +313,37 @@ class StaticInferencePool:
 
     def _build_endpoint_aliases(self, client_config: ClientConfig) -> dict[str, str]:
         admin_urls = client_config.admin_base_url if client_config.admin_base_url else client_config.base_url
-        if len(client_config.base_url) != len(admin_urls):
+        if len(client_config.base_url) == len(admin_urls):
+            return {
+                self._normalize_endpoint_url(base_url): self._normalize_endpoint_url(admin_url)
+                for base_url, admin_url in zip(client_config.base_url, admin_urls)
+            }
+        if len(admin_urls) == 0 or len(client_config.base_url) % len(admin_urls) != 0:
             return {}
+
+        group_size = len(client_config.base_url) // len(admin_urls)
         return {
-            self._normalize_endpoint_url(base_url): self._normalize_endpoint_url(admin_url)
-            for base_url, admin_url in zip(client_config.base_url, admin_urls)
+            self._normalize_endpoint_url(base_url): self._normalize_endpoint_url(admin_urls[idx // group_size])
+            for idx, base_url in enumerate(client_config.base_url)
         }
+
+    def _log_grouped_admin_aliases(self, client_config: ClientConfig) -> None:
+        admin_urls = client_config.admin_base_url if client_config.admin_base_url else client_config.base_url
+        if not self._lease_enabled or len(client_config.base_url) <= len(admin_urls):
+            return
+        if len(admin_urls) == 0 or len(client_config.base_url) % len(admin_urls) != 0:
+            get_logger().warning(
+                f"Lease is enabled with {len(client_config.base_url)} rollout endpoint(s) and {len(admin_urls)} "
+                "admin endpoint(s), but they cannot be grouped evenly; rollout-only endpoints are not directly "
+                "lease-managed."
+            )
+            return
+        group_size = len(client_config.base_url) // len(admin_urls)
+        get_logger().info(
+            f"Lease is enabled with {len(client_config.base_url)} rollout endpoint(s) and {len(admin_urls)} "
+            f"admin endpoint(s); mapping each contiguous group of {group_size} rollout endpoint(s) to one "
+            "admin endpoint."
+        )
 
     def _endpoint_key(self, admin_client: AsyncClient) -> str:
         return self._normalize_endpoint_url(str(admin_client.base_url))

@@ -3,6 +3,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 import verifiers as vf
 
 from prime_rl.orchestrator.scheduler import GroupState, InflightRequest, RolloutClientStats, Scheduler
@@ -234,6 +235,31 @@ def test_policy_update_can_use_stage_commit_protocol():
     asyncio.run(run())
 
 
+def test_policy_update_failure_reopens_checkpoint_ready_after_wait():
+    async def run() -> None:
+        scheduler = make_scheduler()
+        scheduler.config.weight_broadcast = SimpleNamespace(mode="delta")
+
+        async def update_weights(*args, **kwargs) -> None:
+            raise RuntimeError("update failed")
+
+        scheduler.student_inference = SimpleNamespace(
+            update_weights=update_weights,
+            update_model_name=MagicMock(),
+        )
+        scheduler.rollout_inference = scheduler.student_inference
+        scheduler._update_off_policy = AsyncMock()
+
+        with patch("prime_rl.orchestrator.scheduler.wait_for_path", new=AsyncMock()):
+            with pytest.raises(RuntimeError, match="update failed"):
+                await scheduler._apply_policy_update(8)
+
+        assert scheduler.ckpt_step == 7
+        assert scheduler.checkpoint_ready.is_set()
+
+    asyncio.run(run())
+
+
 def test_chunked_stage_transport_uses_chunked_upload_method():
     scheduler = make_scheduler()
     scheduler.config.weight_broadcast = SimpleNamespace(
@@ -357,6 +383,47 @@ def test_background_stage_does_not_clear_checkpoint_ready_until_commit():
         ]
         assert scheduler.ckpt_step == 8
         assert scheduler.checkpoint_ready.is_set()
+
+    asyncio.run(run())
+
+
+def test_background_stage_failure_clears_inflight_task_and_reopens_checkpoint_ready():
+    async def run() -> None:
+        scheduler = make_scheduler()
+        scheduler.config.weight_broadcast = SimpleNamespace(
+            type="filesystem",
+            mode="delta",
+            update_protocol="stage_commit",
+            stage_transport="http_upload",
+            background_stage=True,
+        )
+
+        async def stage_weights(*args, **kwargs) -> None:
+            raise RuntimeError("stage failed")
+
+        scheduler.student_inference = SimpleNamespace(
+            update_weights=AsyncMock(),
+            stage_weights=stage_weights,
+            commit_weights=AsyncMock(),
+            update_model_name=MagicMock(),
+        )
+        scheduler.rollout_inference = scheduler.student_inference
+        scheduler._update_off_policy = AsyncMock()
+
+        with (
+            patch("prime_rl.orchestrator.scheduler.get_latest_ckpt_step", return_value=8),
+            patch("prime_rl.orchestrator.scheduler.wait_for_path", new=AsyncMock()),
+        ):
+            await scheduler.maybe_update_policy(block=False)
+            await asyncio.sleep(0)
+
+            with pytest.raises(RuntimeError, match="stage failed"):
+                await scheduler.maybe_update_policy(block=True)
+
+        assert scheduler.inflight_stage_task is None
+        assert scheduler.inflight_stage_step is None
+        assert scheduler.checkpoint_ready.is_set()
+        assert scheduler.ckpt_step == 7
 
     asyncio.run(run())
 

@@ -1,0 +1,64 @@
+output_dir = "/dev/shm/prime-rl-full-feature-relay-e2e/rl"
+clean_output_dir = false
+max_steps = 3
+seq_len = 1024
+
+[deployment]
+num_train_gpus = 1
+num_infer_gpus = 0
+gpus_per_node = 4
+
+[weight_broadcast]
+type = "filesystem"
+# ////////////////// PRIME-RL MIGRATION FIELDS //////////////////
+mode = "delta"  # options: "full", "delta"
+update_protocol = "stage_commit"  # options: "direct", "stage_commit"
+stage_transport = "streaming_upload"  # options: "shared_fs", "http_upload", "chunked_upload", "streaming_upload"
+background_stage = true
+retain_all_deltas = true
+# ////////////////// END PRIME-RL MIGRATION FIELDS //////////////////
+
+[model]
+name = "Qwen/Qwen3-0.6B"
+
+[trainer.model]
+impl = "hf"
+
+[trainer.optim]
+lr = 1e-5
+
+[orchestrator]
+batch_size = 8
+group_size = 1
+max_inflight_rollouts = 8
+# ////////////////// PRIME-RL MIGRATION FIELDS //////////////////
+enable_load_balancing = true
+throughput_ema_beta = 0.5  # range: 0.0 to 1.0
+# ////////////////// END PRIME-RL MIGRATION FIELDS //////////////////
+
+[orchestrator.client]
+base_url = ["http://127.0.0.1:8401/v1", "http://127.0.0.1:8402/v1"]
+admin_base_url = ["http://127.0.0.1:8401"]
+# ////////////////// PRIME-RL MIGRATION FIELDS //////////////////
+# With fewer admin URLs than rollout URLs, lease state is grouped by admin seed.
+lease_enabled = true
+lease_cooldown_s = 0.0  # seconds, must be >= 0
+lease_recovery_enabled = true
+lease_recovery_poll_interval_s = 1.0  # seconds, must be > 0
+# ////////////////// END PRIME-RL MIGRATION FIELDS //////////////////
+
+[orchestrator.advantage]
+type = "custom"
+import_path = "prime_rl.orchestrator.debug_advantages.constant_advantage"
+kwargs = { value = 1.0 }
+
+[orchestrator.train.sampling]
+max_completion_tokens = 16
+
+[[orchestrator.train.env]]
+id = "alphabet-sort"
+name = "alphabet-sort"
+args = { min_turns = 1, max_turns = 1, min_names_per_turn = 1, max_names_per_turn = 2, similarity_power = 2, power_per_turn = false }
+
+[orchestrator.renderer]
+name = "default"

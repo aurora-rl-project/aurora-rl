@@ -12,6 +12,7 @@ from prime_rl.configs.orchestrator import OrchestratorConfig
 from prime_rl.configs.rl import RLConfig
 from prime_rl.configs.sft import SFTConfig
 from prime_rl.configs.shared import ClientConfig
+from prime_rl.configs.trainer import FileSystemWeightBroadcastConfig as TrainerFileSystemWeightBroadcastConfig
 from prime_rl.configs.trainer import ModelConfig as TrainerModelConfig
 from prime_rl.configs.trainer import TrainerConfig
 from prime_rl.utils.config import BaseConfig, cli
@@ -300,6 +301,82 @@ def test_orchestrator_load_balancing_config_defaults_and_overrides():
 def test_client_lease_recovery_requires_lease_enabled():
     with pytest.raises(ValidationError, match="lease recovery requires client.lease_enabled=true"):
         ClientConfig(lease_recovery_enabled=True)
+
+
+def test_client_lease_requires_static_inference_pool():
+    with pytest.raises(ValidationError, match="static inference pool"):
+        ClientConfig(lease_enabled=True, elastic={"hostname": "inference.local"})
+
+
+def test_filesystem_background_stage_requires_stage_commit():
+    with pytest.raises(ValidationError, match="background_stage requires update_protocol='stage_commit'"):
+        RLConfig.model_validate(
+            {
+                "weight_broadcast": {
+                    "type": "filesystem",
+                    "background_stage": True,
+                },
+                "trainer": {},
+                "orchestrator": {"renderer": None},
+                "inference": {},
+            }
+        )
+
+
+def test_http_stage_transport_requires_delta_mode():
+    with pytest.raises(ValidationError, match="HTTP stage transports currently require"):
+        RLConfig.model_validate(
+            {
+                "weight_broadcast": {
+                    "type": "filesystem",
+                    "mode": "full",
+                    "update_protocol": "stage_commit",
+                    "stage_transport": "streaming_upload",
+                },
+                "trainer": {},
+                "orchestrator": {"renderer": None},
+                "inference": {},
+            }
+        )
+
+
+def test_retain_all_deltas_requires_delta_mode():
+    with pytest.raises(ValidationError, match="retain_all_deltas requires weight_broadcast.mode='delta'"):
+        RLConfig.model_validate(
+            {
+                "weight_broadcast": {
+                    "type": "filesystem",
+                    "mode": "full",
+                    "retain_all_deltas": True,
+                },
+                "trainer": {},
+                "orchestrator": {"renderer": None},
+                "inference": {},
+            }
+        )
+
+    with pytest.raises(ValidationError, match="retain_all_deltas requires mode='delta'"):
+        TrainerFileSystemWeightBroadcastConfig(mode="full", retain_all_deltas=True)
+
+
+def test_stage_commit_requires_static_inference_pool():
+    with pytest.raises(ValidationError, match="static inference pool"):
+        RLConfig.model_validate(
+            {
+                "weight_broadcast": {
+                    "type": "filesystem",
+                    "mode": "delta",
+                    "update_protocol": "stage_commit",
+                    "stage_transport": "streaming_upload",
+                },
+                "trainer": {},
+                "orchestrator": {
+                    "renderer": None,
+                    "client": {"elastic": {"hostname": "inference.local"}},
+                },
+                "inference": {},
+            }
+        )
 
 
 def test_lease_recovery_requires_delta_retention():
