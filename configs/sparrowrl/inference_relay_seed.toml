@@ -1,0 +1,20 @@
+data_parallel_rpc_port = 13701
+
+[model]
+name = "Qwen/Qwen3-4B"
+
+[server]
+host = "0.0.0.0"
+port = 8401
+staging_dir = "/dev/shm/sparrowrl-relay/staging/seed"
+
+[weight_broadcast]
+type = "filesystem"
+
+[relay]
+enabled = true
+peers = ["http://127.0.0.1:8402"]
+fail_on_peer_error = true
+stage_timeout_s = 3600.0
+commit_timeout_s = 600.0
+reload_timeout_s = 600.0

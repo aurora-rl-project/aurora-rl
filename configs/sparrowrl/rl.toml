@@ -1,0 +1,69 @@
+output_dir = "/dev/shm/sparrowrl/rl"
+clean_output_dir = false
+max_steps = 800
+seq_len = 2048
+
+[wandb]
+project = "sparrowrl"
+name = "sparrowrl-qwen3-4b-gsm8k"
+tags = ["sparrowrl", "gsm8k", "qwen3-4b", "batch-512", "sparse-delta", "streaming", "multi-endpoint"]
+offline = false
+
+[deployment]
+num_train_gpus = 1
+num_infer_gpus = 0
+gpus_per_node = 1
+
+[weight_broadcast]
+type = "filesystem"
+mode = "delta"
+update_protocol = "stage_commit"
+stage_transport = "streaming_upload"
+background_stage = true
+retain_all_deltas = true
+
+[model]
+name = "Qwen/Qwen3-4B"
+
+[trainer.model]
+impl = "hf"
+
+[trainer.model.ac]
+freq = 1
+
+[trainer.optim]
+lr = 1e-6
+
+[ckpt]
+interval = 100
+
+[orchestrator]
+batch_size = 512
+group_size = 8
+max_inflight_rollouts = 512
+enable_load_balancing = true
+throughput_ema_beta = 0.8
+
+[orchestrator.wandb.log_extras]
+samples = true
+distributions = true
+interval = 10
+sample_ratio = 0.05
+
+[orchestrator.student.client]
+base_url = ["http://127.0.0.1:8401/v1", "http://127.0.0.1:8402/v1"]
+lease_enabled = true
+lease_cooldown_s = 20.0
+lease_recovery_enabled = true
+lease_recovery_poll_interval_s = 5.0
+
+[orchestrator.train.sampling]
+max_completion_tokens = 2048
+
+[[orchestrator.train.env]]
+id = "math-env"
+name = "gsm8k"
+args = { dataset_name = "openai/gsm8k", dataset_subset = "main", math_verify_max_workers = 128, math_verify_timeout = 60 }
+
+[orchestrator.renderer]
+name = "default"
