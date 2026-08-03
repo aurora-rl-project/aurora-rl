@@ -8,6 +8,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Protocol
 
+import numba as nb
 import numpy as np
 import torch
 from safetensors import safe_open
@@ -94,26 +95,47 @@ FUSED_BIAS_RULES = (
 )
 
 
+@nb.njit(cache=False)
+def _encode_varint_delta_indices_numba(indices: np.ndarray) -> np.ndarray:
+    count = indices.size
+    encoded_size = 0
+    previous = 0
+    for i in range(count):
+        current = indices[i]
+        if current < 0:
+            raise ValueError("sparse delta indices must be non-negative")
+        if current < previous:
+            raise ValueError("varint delta encoding expects sorted indices")
+        diff = current - previous
+        previous = current
+        encoded_size += 1
+        while diff >= 0x80:
+            diff >>= 7
+            encoded_size += 1
+
+    encoded = np.empty((encoded_size,), dtype=np.uint8)
+    output_index = 0
+    previous = 0
+    for i in range(count):
+        current = indices[i]
+        diff = current - previous
+        previous = current
+        while diff >= 0x80:
+            encoded[output_index] = (diff & 0x7F) | 0x80
+            output_index += 1
+            diff >>= 7
+        encoded[output_index] = diff
+        output_index += 1
+    return encoded
+
+
 def encode_varint_delta_indices(indices: torch.Tensor) -> torch.Tensor:
     indices = indices.reshape(-1).detach().to(torch.int64).cpu()
     if indices.numel() == 0:
         return torch.empty((0,), dtype=torch.uint8)
-    if bool((indices < 0).any().item()):
-        raise ValueError("sparse delta indices must be non-negative")
-    if indices.numel() > 1 and bool((indices[1:] < indices[:-1]).any().item()):
-        raise ValueError("varint delta encoding expects sorted indices")
 
-    encoded = bytearray()
-    previous = 0
-    for current in indices.tolist():
-        diff = int(current) - previous
-        while diff >= 0x80:
-            encoded.append((diff & 0x7F) | 0x80)
-            diff >>= 7
-        encoded.append(diff)
-        previous = int(current)
-
-    return torch.tensor(list(encoded), dtype=torch.uint8)
+    encoded = _encode_varint_delta_indices_numba(indices.contiguous().numpy())
+    return torch.from_numpy(encoded)
 
 
 def decode_varint_delta_indices(index_bytes: torch.Tensor, expected_count: int) -> torch.Tensor:
@@ -564,13 +586,17 @@ class ModelDeltaManager:
 
             flat_base = base_tensor.reshape(-1)
             flat_target = target_tensor.reshape(-1)
-            delta = flat_target - flat_base
-            mask = delta.abs() > threshold
-            indices = torch.nonzero(mask, as_tuple=False).flatten()
+            if threshold == 0.0:
+                indices = torch.nonzero(flat_target != flat_base, as_tuple=False).flatten()
+            else:
+                delta = flat_target - flat_base
+                indices = torch.nonzero(delta.abs() > threshold, as_tuple=False).flatten()
             if indices.numel() == 0:
                 continue
 
-            values = delta.index_select(0, indices).contiguous().to(base_tensor.dtype)
+            values = (
+                flat_target.index_select(0, indices) - flat_base.index_select(0, indices)
+            ).contiguous().to(base_tensor.dtype)
             changed_params += int(indices.numel())
 
             if mapped.part_order is None:
@@ -592,7 +618,8 @@ class ModelDeltaManager:
             val_list: list[torch.Tensor] = []
             for order in range(expected):
                 for indices, values in zip(idx_parts[name].get(order, []), val_parts[name].get(order, [])):
-                    idx_list.append(indices + offsets[order])
+                    offset = offsets[order]
+                    idx_list.append(indices if offset == 0 else indices + offset)
                     val_list.append(values)
 
             if idx_list:
@@ -630,12 +657,8 @@ def _add_sparse_tensor(
     if len(index_chunks) != len(value_chunks):
         raise ValueError(f"index/value chunks mismatch for {name}")
 
-    indices = torch.cat(index_chunks, dim=0).to(torch.int64)
-    values = torch.cat(value_chunks, dim=0)
-    if indices.numel() > 1:
-        order = torch.argsort(indices)
-        indices = indices.index_select(0, order)
-        values = values.index_select(0, order)
+    indices = (index_chunks[0] if len(index_chunks) == 1 else torch.cat(index_chunks, dim=0)).to(torch.int64)
+    values = value_chunks[0] if len(value_chunks) == 1 else torch.cat(value_chunks, dim=0)
 
     delta_tensors[f"{name}{DELTA_INDEX_SUFFIX}"] = encode_sparse_indices(indices, encoding=index_encoding)
     delta_tensors[f"{name}{DELTA_VALUE_SUFFIX}"] = values
