@@ -1,0 +1,15 @@
+data_parallel_rpc_port = 13702
+
+[model]
+name = "Qwen/Qwen3-4B"
+
+[server]
+host = "0.0.0.0"
+port = 8402
+staging_dir = "/dev/shm/aurorarl-relay/staging/peer"
+
+[weight_broadcast]
+type = "filesystem"
+
+[relay]
+enabled = false

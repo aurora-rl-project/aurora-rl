@@ -1,0 +1,66 @@
+output_dir = "/dev/shm/aurorarl/rl"
+clean_output_dir = false
+max_steps = 800
+seq_len = 2048
+
+[wandb]
+project = "aurorarl"
+name = "aurorarl-qwen3-4b-deepscaler"
+tags = ["aurorarl", "deepscaler", "qwen3-4b", "batch-512", "sparse-delta", "streaming", "multi-endpoint"]
+offline = false
+
+[deployment]
+num_train_gpus = 1
+num_infer_gpus = 0
+gpus_per_node = 1
+
+[weight_broadcast]
+type = "filesystem"
+mode = "delta"
+update_protocol = "stage_commit"
+stage_transport = "streaming_upload"
+background_stage = true
+retain_all_deltas = false
+
+[model]
+name = "Qwen/Qwen3-4B"
+
+[trainer.model]
+impl = "hf"
+
+[trainer.model.ac]
+freq = 1
+
+[trainer.optim]
+lr = 1e-6
+
+[ckpt]
+interval = 100
+
+[orchestrator]
+batch_size = 512
+group_size = 8
+max_inflight_rollouts = 512
+enable_load_balancing = false
+
+[orchestrator.wandb.log_extras]
+samples = true
+distributions = true
+interval = 10
+sample_ratio = 0.05
+
+[orchestrator.student.client]
+base_url = ["http://127.0.0.1:8401/v1", "http://127.0.0.1:8402/v1"]
+admin_base_url = ["http://127.0.0.1:8401", "http://127.0.0.1:8402"]
+lease_enabled = false
+lease_recovery_enabled = false
+
+[orchestrator.train.sampling]
+max_completion_tokens = 2048
+
+[[orchestrator.train.env]]
+id = "deepscaler-math"
+name = "deepscaler"
+
+[orchestrator.renderer]
+name = "default"

@@ -77,9 +77,13 @@ COPY deps/ /app/deps/
 COPY configs /app/configs
 COPY examples /app/examples
 COPY benchmarks/scripts /app/benchmarks/scripts
+COPY scripts/run_aurorarl.sh /app/scripts/run_aurorarl.sh
+RUN chmod +x /app/scripts/run_aurorarl.sh
 
 RUN --mount=type=cache,target=/app/.cache/uv \
     uv sync --extra flash-attn --extra flash-attn-3 --extra flash-attn-cute --extra envs --extra gpt-oss --extra modelexpress --group mamba-ssm --locked --no-dev
+RUN PRIME_DISABLE_VERSION_CHECK=1 uv run --no-sync prime --plain env install \
+    primeintellect/deepscaler-math@0.1.5 --no-upgrade
 
 # arm64: build flash-attn from source, fix namespace conflicts, apply workarounds
 ARG TARGETARCH
@@ -119,7 +123,9 @@ ARG GROUP_ID=1000
 RUN groupadd --gid $GROUP_ID appuser && \
     useradd --uid $USER_ID --gid appuser --create-home --shell /bin/bash appuser && \
     usermod -aG sudo appuser && \
-    echo "appuser ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
+    echo "appuser ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers && \
+    mkdir -p /cache/hf /cache/vllm /cache/wandb /outputs && \
+    chown -R appuser:appuser /cache /outputs
 
 # Install uv for development use
 ADD https://astral.sh/uv/install.sh /uv-installer.sh
@@ -142,6 +148,7 @@ RUN rm /app/.venv/bin/python3.12 && ln -s /usr/local/bin/python /app/.venv/bin/p
 
 # Place executables in the environment at the front of the path
 ENV PATH="/app/.venv/bin:$PATH"
+ENV UV_NO_SYNC=1
 ENV UCX_HOME=/opt/ucx
 ENV LD_LIBRARY_PATH="/opt/ucx/lib:/opt/ucx/lib/ucx${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 

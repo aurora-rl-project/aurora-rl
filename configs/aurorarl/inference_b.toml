@@ -6,10 +6,7 @@ name = "Qwen/Qwen3-4B"
 [server]
 host = "0.0.0.0"
 port = 8402
-staging_dir = "/dev/shm/sparrowrl-relay/staging/peer"
+staging_dir = "/dev/shm/aurorarl/staging/inference-b"
 
 [weight_broadcast]
 type = "filesystem"
-
-[relay]
-enabled = false

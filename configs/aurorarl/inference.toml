@@ -1,12 +1,12 @@
-data_parallel_rpc_port = 13702
+data_parallel_rpc_port = 13701
 
 [model]
 name = "Qwen/Qwen3-4B"
 
 [server]
 host = "0.0.0.0"
-port = 8402
-staging_dir = "/dev/shm/sparrowrl/staging/inference-b"
+port = 8401
+staging_dir = "/dev/shm/aurorarl/staging/inference-a"
 
 [weight_broadcast]
 type = "filesystem"

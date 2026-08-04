@@ -6,7 +6,7 @@ name = "Qwen/Qwen3-4B"
 [server]
 host = "0.0.0.0"
 port = 8401
-staging_dir = "/dev/shm/sparrowrl/staging/inference-a"
+staging_dir = "/dev/shm/aurorarl/staging/inference"
 
 [weight_broadcast]
 type = "filesystem"

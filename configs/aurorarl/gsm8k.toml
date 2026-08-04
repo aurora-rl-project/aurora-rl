@@ -1,12 +1,12 @@
-output_dir = "outputs/sparrowrl-gsm8k"
+output_dir = "outputs/aurorarl-gsm8k"
 clean_output_dir = false
 max_steps = 100
 seq_len = 2048
 
 [wandb]
-project = "sparrowrl"
+project = "aurorarl"
 name = "qwen3-0.6b-gsm8k-sparse-delta"
-tags = ["sparrowrl", "gsm8k", "qwen3-0.6b", "sparse-delta", "streaming"]
+tags = ["aurorarl", "gsm8k", "qwen3-0.6b", "sparse-delta", "streaming"]
 offline = false
 
 [deployment]
@@ -46,4 +46,4 @@ name = "auto"
 preserve_all_thinking = true
 
 [inference.server]
-staging_dir = "/dev/shm/sparrowrl-gsm8k/staging"
+staging_dir = "/dev/shm/aurorarl-gsm8k/staging"

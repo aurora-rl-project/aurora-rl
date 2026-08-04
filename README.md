@@ -1,15 +1,14 @@
-# SparrowRL
+# AuroraRL
 
-SparrowRL extends [PRIME-RL](https://github.com/PrimeIntellect-ai/prime-rl) for
-RL deployments where trainers and inference servers may be separated by slow
-or long-distance networks. It adds sparse delta weight updates, HTTP streaming
-stage/commit, multi-endpoint inference, load-aware routing, endpoint recovery,
-and regional relay fan-out.
+AuroraRL supports RL deployments where trainers and inference servers may be
+separated by slow or long-distance networks. It adds sparse delta weight
+updates, HTTP streaming stage/commit, multi-endpoint inference, load-aware
+routing, endpoint recovery, and regional relay fan-out.
 
 ## Features
 
-- Exact sparse deltas stored as safetensors with compact index encoding.
-- Background HTTP streaming upload followed by an explicit version commit.
+- Exact sparse deltas with compact index encoding.
+- Streaming extraction and background HTTP upload.
 - Multiple inference endpoints for rollout routing and weight-update fan-out.
 - Optional throughput-aware load balancing.
 - Optional endpoint quarantine and delta-chain recovery.
@@ -18,7 +17,7 @@ and regional relay fan-out.
 
 ## Installation
 
-SparrowRL requires Linux, Python 3.12, NVIDIA GPUs, and
+AuroraRL requires Linux, Python 3.12, NVIDIA GPUs, and
 [uv](https://docs.astral.sh/uv/).
 
 ```bash
@@ -49,7 +48,7 @@ Verify the environment:
 
 ```bash
 uv run python -V
-uv run rl @ configs/sparrowrl/gsm8k.toml --dry-run --output-dir /tmp/sparrowrl-dry-run
+uv run rl @ configs/aurorarl/gsm8k.toml --dry-run --output-dir /tmp/aurorarl-dry-run
 ```
 
 ## Quick Start: GSM8K
@@ -68,7 +67,7 @@ export WANDB_API_KEY="<your-key>"
 Start the complete local run:
 
 ```bash
-uv run rl @ configs/sparrowrl/gsm8k.toml \
+uv run rl @ configs/aurorarl/gsm8k.toml \
   --output-dir outputs/gsm8k
 ```
 
@@ -80,24 +79,24 @@ the same config. Use `WANDB_MODE=offline` if online logging is not needed.
 Configs are TOML files loaded with `@`. CLI values override TOML values:
 
 ```bash
-uv run rl @ configs/sparrowrl/gsm8k.toml --max-steps 10
-uv run inference @ configs/sparrowrl/inference.toml --server.port 8501
+uv run rl @ configs/aurorarl/gsm8k.toml --max-steps 10
+uv run inference @ configs/aurorarl/inference.toml --server.port 8501
 ```
 
 Direct profiles:
 
-- `configs/sparrowrl/gsm8k.toml`: two-GPU sparse-delta Quick Start.
-- `configs/sparrowrl/rl.toml`: external multi-endpoint RL with load balancing
+- `configs/aurorarl/gsm8k.toml`: two-GPU sparse-delta Quick Start.
+- `configs/aurorarl/rl.toml`: external multi-endpoint RL with load balancing
   and lease recovery.
-- `configs/sparrowrl/inference.toml`: first standalone inference endpoint.
-- `configs/sparrowrl/inference_b.toml`: second standalone inference endpoint.
+- `configs/aurorarl/inference.toml`: first standalone inference endpoint.
+- `configs/aurorarl/inference_b.toml`: second standalone inference endpoint.
 
 Relay profiles:
 
-- `configs/sparrowrl/relay_rl.toml`: rollout traffic to seed and peer, weight
+- `configs/aurorarl/relay_rl.toml`: rollout traffic to seed and peer, weight
   updates to the seed.
-- `configs/sparrowrl/inference_relay_seed.toml`: relay seed and its peer list.
-- `configs/sparrowrl/inference_relay_peer.toml`: inference peer.
+- `configs/aurorarl/inference_relay_seed.toml`: relay seed and its peer list.
+- `configs/aurorarl/inference_relay_peer.toml`: inference peer.
 
 ### Sparse Delta Transfer
 
@@ -109,11 +108,17 @@ update_protocol = "stage_commit"
 stage_transport = "streaming_upload"
 background_stage = true
 retain_all_deltas = true
+delta_stream_group_size = 4
 ```
 
 `type = "filesystem"` selects file-based weight artifacts; it does not require
 a shared filesystem. With `streaming_upload`, the orchestrator uploads the
 trainer-local delta over HTTP to each inference server's staging directory.
+It also enables trainer-side streaming extraction: tensor records are appended
+to `delta.stream` and uploaded while later layers are still being scanned.
+`delta_stream_group_size` controls how many transformer layers are processed
+between file flushes. Other stage transports continue to use standard
+`delta.safetensors` files.
 
 ### Multi-endpoint Routing
 
@@ -143,7 +148,7 @@ lease_recovery_enabled = true
 lease_recovery_poll_interval_s = 5.0
 ```
 
-Failed endpoints are removed from routing. After recovery, SparrowRL reloads
+Failed endpoints are removed from routing. After recovery, AuroraRL reloads
 the base weights and replays the retained delta chain to the active version.
 
 ### Regional Relay
@@ -171,9 +176,9 @@ fail_on_peer_error = true
 For a local three-GPU relay run, start these in separate terminals:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 uv run inference @ configs/sparrowrl/inference_relay_seed.toml
-CUDA_VISIBLE_DEVICES=1 uv run inference @ configs/sparrowrl/inference_relay_peer.toml
-CUDA_VISIBLE_DEVICES=2 uv run rl @ configs/sparrowrl/relay_rl.toml
+CUDA_VISIBLE_DEVICES=0 uv run inference @ configs/aurorarl/inference_relay_seed.toml
+CUDA_VISIBLE_DEVICES=1 uv run inference @ configs/aurorarl/inference_relay_peer.toml
+CUDA_VISIBLE_DEVICES=2 uv run rl @ configs/aurorarl/relay_rl.toml
 ```
 
 ## Separate Trainer and Inference
@@ -183,21 +188,21 @@ separate terminals:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 \
-uv run inference @ configs/sparrowrl/inference.toml
+uv run inference @ configs/aurorarl/inference.toml
 ```
 
 ```bash
 CUDA_VISIBLE_DEVICES=1 \
-uv run inference @ configs/sparrowrl/inference_b.toml
+uv run inference @ configs/aurorarl/inference_b.toml
 ```
 
 ```bash
 CUDA_VISIBLE_DEVICES=2 \
-uv run rl @ configs/sparrowrl/rl.toml
+uv run rl @ configs/aurorarl/rl.toml
 ```
 
 The default endpoints use `127.0.0.1`. For multi-machine deployment, replace
-them in `configs/sparrowrl/rl.toml` with the inference hosts' reachable
+them in `configs/aurorarl/rl.toml` with the inference hosts' reachable
 addresses.
 
 The trainer's broadcast directory remains local. Deltas are uploaded to each

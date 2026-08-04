@@ -1,0 +1,84 @@
+output_dir = "/dev/shm/prime-rl-full-feature-relay-realistic/rl"
+clean_output_dir = false
+max_steps = 200
+seq_len = 2048
+
+[wandb]
+project = "prime-rl-full-feature-e2e"
+name = "qwen3-0p6b-full-feature-relay-realistic"
+tags = ["e2e", "realistic", "batch-512", "sparse-delta", "streaming", "relay", "load-balancing"]
+offline = false
+
+[deployment]
+num_train_gpus = 1
+num_infer_gpus = 0
+gpus_per_node = 4
+
+[weight_broadcast]
+type = "filesystem"
+# ////////////////// PRIME-RL MIGRATION FIELDS //////////////////
+mode = "delta"  # options: "full", "delta"
+update_protocol = "stage_commit"  # options: "direct", "stage_commit"
+stage_transport = "streaming_upload"  # options: "shared_fs", "http_upload", "chunked_upload", "streaming_upload"
+background_stage = true
+retain_all_deltas = true
+# ////////////////// END PRIME-RL MIGRATION FIELDS //////////////////
+
+[model]
+name = "Qwen/Qwen3-0.6B"
+
+[trainer.model]
+impl = "hf"
+
+[trainer.optim]
+lr = 1e-5
+
+[orchestrator]
+batch_size = 512
+group_size = 16
+max_inflight_rollouts = 512
+# ////////////////// PRIME-RL MIGRATION FIELDS //////////////////
+enable_load_balancing = true
+throughput_ema_beta = 0.5  # range: 0.0 to 1.0
+# ////////////////// END PRIME-RL MIGRATION FIELDS //////////////////
+
+[orchestrator.wandb.log_extras]
+samples = true
+distributions = true
+interval = 10
+sample_ratio = 0.05
+
+[orchestrator.client]
+base_url = ["http://127.0.0.1:8401/v1", "http://127.0.0.1:8402/v1"]
+admin_base_url = ["http://127.0.0.1:8401"]
+# ////////////////// PRIME-RL MIGRATION FIELDS //////////////////
+# With fewer admin URLs than rollout URLs, lease state is grouped by admin seed.
+lease_enabled = true
+lease_cooldown_s = 0.0  # seconds, must be >= 0
+lease_recovery_enabled = true
+lease_recovery_poll_interval_s = 1.0  # seconds, must be > 0
+# ////////////////// END PRIME-RL MIGRATION FIELDS //////////////////
+
+[orchestrator.train.sampling]
+max_completion_tokens = 512
+
+[[orchestrator.train.env]]
+id = "alphabet-sort"
+name = "alphabet-sort"
+args = { min_turns = 2, max_turns = 2 }
+
+[orchestrator.eval]
+interval = 50
+
+[orchestrator.eval.sampling]
+max_completion_tokens = 512
+
+[[orchestrator.eval.env]]
+id = "alphabet-sort"
+name = "alphabet-sort"
+num_examples = 50
+group_size = 4
+args = { min_turns = 2, max_turns = 2 }
+
+[orchestrator.renderer]
+name = "default"

@@ -204,12 +204,8 @@ outputs/
 
 third_party/
 
-# Local SparrowRL runs and container experiments
+# Local AuroraRL run artifacts
 .run/
-.dockerignore
-configs/docker/
-docs/sparrowrl_container.md
-scripts/run_sparrowrl.sh
 
 # Local migration notes
 docs/current_migration_*
