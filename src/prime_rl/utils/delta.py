@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import json
 import os
+import struct
 from collections import defaultdict
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import BinaryIO, Protocol
 
 import numba as nb
 import numpy as np
@@ -19,6 +20,28 @@ DELTA_VALUE_SUFFIX = ".__val"
 DELTA_METADATA_FORMAT_KEY = "prime_rl_delta_format"
 DELTA_METADATA_FORMAT_VALUE = "sparse_delta_v1"
 DELTA_METADATA = {DELTA_METADATA_FORMAT_KEY: DELTA_METADATA_FORMAT_VALUE}
+STREAMING_DELTA_FILENAME = "delta.stream"
+SAFETENSORS_DELTA_FILENAME = "delta.safetensors"
+
+_STREAM_MAGIC = b"PDELSTRM"
+_STREAM_VERSION = 1
+_STREAM_HEADER = struct.Struct("<8sI")
+_STREAM_RECORD = struct.Struct("<I B B H Q Q")
+_STREAM_INDEX_VARINT = 0
+_STREAM_INDEX_RAW32 = 1
+_STREAM_INDEX_RAW64 = 2
+_STREAM_DTYPE_TO_CODE = {
+    torch.float16: 1,
+    torch.bfloat16: 2,
+    torch.float32: 3,
+    torch.float64: 4,
+    torch.int64: 5,
+    torch.int32: 6,
+    torch.int8: 7,
+    torch.uint8: 8,
+}
+_STREAM_CODE_TO_DTYPE = {code: dtype for dtype, code in _STREAM_DTYPE_TO_CODE.items()}
+_STREAM_DTYPE_SIZE = {dtype: torch.empty((), dtype=dtype).element_size() for dtype in _STREAM_DTYPE_TO_CODE}
 
 
 @dataclass(frozen=True)
@@ -45,6 +68,13 @@ class DeltaVerificationResult:
     @property
     def ok(self) -> bool:
         return len(self.mismatches) == 0
+
+
+@dataclass(frozen=True)
+class StreamingDeltaRecord:
+    name: str
+    encoded_indices: torch.Tensor
+    values: torch.Tensor
 
 
 @dataclass(frozen=True)
@@ -77,6 +107,148 @@ class StateDictTensorStore:
 
     def get_tensor(self, name: str) -> torch.Tensor:
         return self._state_dict[name]
+
+
+class StreamingDeltaWriter:
+    def __init__(self, path: str | Path):
+        self._file = Path(path).open("wb")
+        self._file.write(_STREAM_HEADER.pack(_STREAM_MAGIC, _STREAM_VERSION))
+        self._file.flush()
+
+    def write_record(
+        self,
+        name: str,
+        indices: torch.Tensor,
+        values: torch.Tensor,
+        *,
+        index_encoding: str,
+    ) -> None:
+        encoded_indices = encode_sparse_indices(indices, encoding=index_encoding).contiguous().cpu()
+        values = values.reshape(-1).contiguous().cpu()
+        index_format = _stream_index_format(encoded_indices)
+        dtype_code = _STREAM_DTYPE_TO_CODE.get(values.dtype)
+        if dtype_code is None:
+            raise ValueError(f"unsupported streaming delta value dtype: {values.dtype}")
+
+        name_bytes = name.encode("utf-8")
+        index_bytes = encoded_indices.numel() * encoded_indices.element_size()
+        self._file.write(
+            _STREAM_RECORD.pack(
+                len(name_bytes),
+                index_format,
+                dtype_code,
+                0,
+                index_bytes,
+                values.numel(),
+            )
+        )
+        self._file.write(name_bytes)
+        _write_tensor_bytes(self._file, encoded_indices)
+        _write_tensor_bytes(self._file, values)
+
+    def flush(self) -> None:
+        self._file.flush()
+
+    def close(self) -> None:
+        self._file.close()
+
+
+class StreamingDeltaTensorStore:
+    def __init__(self, path: str | Path):
+        self._tensors: dict[str, torch.Tensor] = {}
+        for record in iter_streaming_delta_records(path):
+            index_key = f"{record.name}{DELTA_INDEX_SUFFIX}"
+            value_key = f"{record.name}{DELTA_VALUE_SUFFIX}"
+            if index_key in self._tensors:
+                raise ValueError(f"duplicate streaming delta record: {record.name}")
+            self._tensors[index_key] = record.encoded_indices
+            self._tensors[value_key] = record.values
+
+    def keys(self) -> Iterable[str]:
+        return self._tensors.keys()
+
+    def get_tensor(self, name: str) -> torch.Tensor:
+        return self._tensors[name]
+
+
+def is_streaming_delta_file(path: str | Path) -> bool:
+    path = Path(path)
+    if not path.is_file() or path.stat().st_size < len(_STREAM_MAGIC):
+        return False
+    with path.open("rb") as stream:
+        return stream.read(len(_STREAM_MAGIC)) == _STREAM_MAGIC
+
+
+def iter_streaming_delta_records(path: str | Path) -> Iterator[StreamingDeltaRecord]:
+    with Path(path).open("rb") as stream:
+        header = _read_exact(stream, _STREAM_HEADER.size, "streaming delta header")
+        magic, version = _STREAM_HEADER.unpack(header)
+        if magic != _STREAM_MAGIC:
+            raise ValueError("streaming delta magic mismatch")
+        if version != _STREAM_VERSION:
+            raise ValueError(f"unsupported streaming delta version: {version}")
+
+        while record_header := stream.read(_STREAM_RECORD.size):
+            if len(record_header) != _STREAM_RECORD.size:
+                raise ValueError("truncated streaming delta record header")
+            name_size, index_format, dtype_code, reserved, index_size, value_count = _STREAM_RECORD.unpack(
+                record_header
+            )
+            if reserved != 0:
+                raise ValueError("streaming delta record has unsupported flags")
+            dtype = _STREAM_CODE_TO_DTYPE.get(dtype_code)
+            if dtype is None:
+                raise ValueError(f"unsupported streaming delta dtype code: {dtype_code}")
+
+            name = _read_exact(stream, name_size, "streaming delta tensor name").decode("utf-8")
+            index_bytes = _read_exact(stream, index_size, f"streaming delta indices for {name}")
+            value_size = value_count * _STREAM_DTYPE_SIZE[dtype]
+            value_bytes = _read_exact(stream, value_size, f"streaming delta values for {name}")
+            encoded_indices = _tensor_from_stream_bytes(index_bytes, _stream_index_dtype(index_format, index_size))
+            values = _tensor_from_stream_bytes(value_bytes, dtype)
+            yield StreamingDeltaRecord(name=name, encoded_indices=encoded_indices, values=values)
+
+
+def _stream_index_format(indices: torch.Tensor) -> int:
+    if indices.dtype == torch.uint8:
+        return _STREAM_INDEX_VARINT
+    if indices.dtype == torch.int32:
+        return _STREAM_INDEX_RAW32
+    if indices.dtype == torch.int64:
+        return _STREAM_INDEX_RAW64
+    raise ValueError(f"unsupported streaming delta index dtype: {indices.dtype}")
+
+
+def _stream_index_dtype(index_format: int, index_size: int) -> torch.dtype:
+    if index_format == _STREAM_INDEX_VARINT:
+        return torch.uint8
+    if index_format == _STREAM_INDEX_RAW32:
+        if index_size % 4 != 0:
+            raise ValueError("streaming delta int32 index payload has invalid size")
+        return torch.int32
+    if index_format == _STREAM_INDEX_RAW64:
+        if index_size % 8 != 0:
+            raise ValueError("streaming delta int64 index payload has invalid size")
+        return torch.int64
+    raise ValueError(f"unsupported streaming delta index format: {index_format}")
+
+
+def _read_exact(stream: BinaryIO, size: int, description: str) -> bytearray:
+    data = bytearray(stream.read(size))
+    if len(data) != size:
+        raise ValueError(f"truncated {description}")
+    return data
+
+
+def _tensor_from_stream_bytes(data: bytearray, dtype: torch.dtype) -> torch.Tensor:
+    if not data:
+        return torch.empty((0,), dtype=dtype)
+    return torch.frombuffer(data, dtype=dtype).clone()
+
+
+def _write_tensor_bytes(stream: BinaryIO, tensor: torch.Tensor) -> None:
+    array = tensor.view(torch.uint16).numpy() if tensor.dtype == torch.bfloat16 else tensor.numpy()
+    stream.write(memoryview(array).cast("B"))
 
 
 FUSED_WEIGHT_RULES = (
@@ -340,8 +512,50 @@ def verify_sparse_delta_file(
     with (
         safe_open(base_model_path, framework="pt", device="cpu") as base,
         safe_open(target_model_path, framework="pt", device="cpu") as target,
-        safe_open(delta_path, framework="pt", device="cpu") as delta,
     ):
+        if is_streaming_delta_file(delta_path):
+            return verify_sparse_delta_stores(
+                base,
+                target,
+                StreamingDeltaTensorStore(delta_path),
+                atol=atol,
+                rtol=rtol,
+                max_report=max_report,
+                include_bias=include_bias,
+            )
+        with safe_open(delta_path, framework="pt", device="cpu") as delta:
+            return verify_sparse_delta_stores(
+                base,
+                target,
+                delta,
+                atol=atol,
+                rtol=rtol,
+                max_report=max_report,
+                include_bias=include_bias,
+            )
+
+
+def _verify_sparse_delta_state_stores(
+    base: TensorStore,
+    target: TensorStore,
+    delta_path: str | Path,
+    *,
+    atol: float,
+    rtol: float,
+    max_report: int,
+    include_bias: bool,
+) -> DeltaVerificationResult:
+    if is_streaming_delta_file(delta_path):
+        return verify_sparse_delta_stores(
+            base,
+            target,
+            StreamingDeltaTensorStore(delta_path),
+            atol=atol,
+            rtol=rtol,
+            max_report=max_report,
+            include_bias=include_bias,
+        )
+    with safe_open(delta_path, framework="pt", device="cpu") as delta:
         return verify_sparse_delta_stores(
             base,
             target,
@@ -365,16 +579,15 @@ def verify_sparse_delta_state_dicts(
 ) -> DeltaVerificationResult:
     base = StateDictTensorStore(base_state)
     target = StateDictTensorStore(target_state)
-    with safe_open(delta_path, framework="pt", device="cpu") as delta:
-        return verify_sparse_delta_stores(
-            base,
-            target,
-            delta,
-            atol=atol,
-            rtol=rtol,
-            max_report=max_report,
-            include_bias=include_bias,
-        )
+    return _verify_sparse_delta_state_stores(
+        base,
+        target,
+        delta_path,
+        atol=atol,
+        rtol=rtol,
+        max_report=max_report,
+        include_bias=include_bias,
+    )
 
 
 def verify_sparse_delta_stores(
@@ -447,6 +660,8 @@ def verify_sparse_delta_stores(
 
 
 def count_sparse_delta_values(delta_path: str | Path) -> int:
+    if is_streaming_delta_file(delta_path):
+        return sum(record.values.numel() for record in iter_streaming_delta_records(delta_path))
     total = 0
     with safe_open(delta_path, framework="pt", device="cpu") as delta:
         for key in delta.keys():
@@ -495,6 +710,48 @@ class ModelDeltaManager:
             index_encoding=index_encoding,
             include_bias=False,
             threshold=0.0,
+            collect_stats=save_stats,
+        )
+
+    def extract_sparse_delta_streaming(
+        self,
+        base_model_path: str | Path,
+        finetuned_model_path: str | Path,
+        delta_output_path: str | Path,
+        *,
+        group_size: int = 4,
+        index_encoding: str = "optimized",
+        save_stats: bool = False,
+    ) -> DeltaStats | None:
+        with (
+            safe_open(base_model_path, framework="pt", device="cpu") as base,
+            safe_open(finetuned_model_path, framework="pt", device="cpu") as target,
+        ):
+            return self._extract_sparse_delta_streaming_from_stores(
+                base,
+                target,
+                delta_output_path,
+                group_size=group_size,
+                index_encoding=index_encoding,
+                collect_stats=save_stats,
+            )
+
+    def extract_sparse_delta_streaming_from_state_dicts(
+        self,
+        base_state: Mapping[str, torch.Tensor],
+        finetuned_state: Mapping[str, torch.Tensor],
+        delta_output_path: str | Path,
+        *,
+        group_size: int = 4,
+        index_encoding: str = "optimized",
+        save_stats: bool = False,
+    ) -> DeltaStats | None:
+        return self._extract_sparse_delta_streaming_from_stores(
+            StateDictTensorStore(base_state),
+            StateDictTensorStore(finetuned_state),
+            delta_output_path,
+            group_size=group_size,
+            index_encoding=index_encoding,
             collect_stats=save_stats,
         )
 
@@ -565,10 +822,7 @@ class ModelDeltaManager:
         for key in sorted(keys):
             base_tensor = base.get_tensor(key)
             target_tensor = target.get_tensor(key)
-            if base_tensor.shape != target_tensor.shape:
-                raise ValueError(
-                    f"shape mismatch for {key}: {tuple(base_tensor.shape)} vs {tuple(target_tensor.shape)}"
-                )
+            _validate_tensor_pair(key, base_tensor, target_tensor)
 
             if collect_stats:
                 total_params += base_tensor.numel()
@@ -584,19 +838,10 @@ class ModelDeltaManager:
                 part_sizes[mapped.name][mapped.part_order] = int(base_tensor.numel())
                 part_shapes[mapped.name][mapped.part_order] = base_tensor.shape
 
-            flat_base = base_tensor.reshape(-1)
-            flat_target = target_tensor.reshape(-1)
-            if threshold == 0.0:
-                indices = torch.nonzero(flat_target != flat_base, as_tuple=False).flatten()
-            else:
-                delta = flat_target - flat_base
-                indices = torch.nonzero(delta.abs() > threshold, as_tuple=False).flatten()
+            indices, values = _extract_changed_values(base_tensor, target_tensor, threshold=threshold)
             if indices.numel() == 0:
                 continue
 
-            values = (
-                flat_target.index_select(0, indices) - flat_base.index_select(0, indices)
-            ).contiguous().to(base_tensor.dtype)
             changed_params += int(indices.numel())
 
             if mapped.part_order is None:
@@ -645,6 +890,92 @@ class ModelDeltaManager:
             compression_ratio=compression_ratio,
         )
 
+    def _extract_sparse_delta_streaming_from_stores(
+        self,
+        base: TensorStore,
+        target: TensorStore,
+        delta_output_path: str | Path,
+        *,
+        group_size: int,
+        index_encoding: str,
+        collect_stats: bool,
+    ) -> DeltaStats | None:
+        if group_size < 0:
+            raise ValueError("streaming delta group_size must be non-negative")
+
+        keys = _validated_model_keys(base, target, include_bias=False)
+        fused_parts, _parts_expected, single_keys = build_fused_groups(keys)
+        record_names = sorted(set(fused_parts) | single_keys, key=_stream_record_order)
+        total_params = 0
+        total_bytes = 0
+        changed_params = 0
+
+        writer = StreamingDeltaWriter(delta_output_path)
+        try:
+            for record_index, name in enumerate(record_names):
+                index_chunks: list[torch.Tensor] = []
+                value_chunks: list[torch.Tensor] = []
+
+                if name in fused_parts:
+                    part_tensors: dict[int, torch.Tensor] = {}
+                    offset = 0
+                    for order, key in sorted(fused_parts[name].items()):
+                        base_tensor = base.get_tensor(key)
+                        target_tensor = target.get_tensor(key)
+                        _validate_tensor_pair(key, base_tensor, target_tensor)
+                        part_tensors[order] = base_tensor
+                        total_params += base_tensor.numel()
+                        total_bytes += base_tensor.numel() * base_tensor.element_size()
+                        indices, values = _extract_changed_values(base_tensor, target_tensor)
+                        if indices.numel() > 0:
+                            index_chunks.append(indices if offset == 0 else indices + offset)
+                            value_chunks.append(values)
+                            changed_params += indices.numel()
+                        offset += base_tensor.numel()
+                    _validate_fused_shapes(name, {order: tensor.shape for order, tensor in part_tensors.items()})
+                else:
+                    base_tensor = base.get_tensor(name)
+                    target_tensor = target.get_tensor(name)
+                    _validate_tensor_pair(name, base_tensor, target_tensor)
+                    total_params += base_tensor.numel()
+                    total_bytes += base_tensor.numel() * base_tensor.element_size()
+                    indices, values = _extract_changed_values(base_tensor, target_tensor)
+                    if indices.numel() > 0:
+                        index_chunks.append(indices)
+                        value_chunks.append(values)
+                        changed_params += indices.numel()
+
+                if index_chunks:
+                    indices = index_chunks[0] if len(index_chunks) == 1 else torch.cat(index_chunks)
+                    values = value_chunks[0] if len(value_chunks) == 1 else torch.cat(value_chunks)
+                    writer.write_record(name, indices, values, index_encoding=index_encoding)
+
+                current_group = _stream_group_id(name, group_size)
+                next_group = (
+                    _stream_group_id(record_names[record_index + 1], group_size)
+                    if record_index + 1 < len(record_names)
+                    else None
+                )
+                if group_size == 0 or current_group is None or current_group != next_group:
+                    writer.flush()
+        finally:
+            writer.close()
+
+        if not collect_stats:
+            return None
+        delta_size_mb = os.path.getsize(delta_output_path) / (1024 * 1024)
+        total_size_mb = total_bytes / (1024 * 1024)
+        change_percentage = (changed_params / total_params * 100) if total_params else 0.0
+        compression_ratio = total_size_mb / delta_size_mb if delta_size_mb > 0 else float("inf")
+        return DeltaStats(
+            total_params=total_params,
+            changed_params=changed_params,
+            change_percentage=change_percentage,
+            total_size_mb=total_size_mb,
+            delta_size_mb=delta_size_mb,
+            compression_ratio=compression_ratio,
+        )
+
 
 def _add_sparse_tensor(
     delta_tensors: dict[str, torch.Tensor],
@@ -676,6 +1007,54 @@ def _validated_model_keys(base: TensorStore, target: TensorStore, *, include_bia
     if base_keys != target_keys:
         raise ValueError(f"keys mismatch: base-only={base_keys - target_keys}, target-only={target_keys - base_keys}")
     return base_keys
+
+
+def _validate_tensor_pair(name: str, base_tensor: torch.Tensor, target_tensor: torch.Tensor) -> None:
+    if base_tensor.shape != target_tensor.shape:
+        raise ValueError(
+            f"shape mismatch for {name}: {tuple(base_tensor.shape)} vs {tuple(target_tensor.shape)}"
+        )
+
+
+def _extract_changed_values(
+    base_tensor: torch.Tensor,
+    target_tensor: torch.Tensor,
+    *,
+    threshold: float = 0.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    flat_base = base_tensor.reshape(-1)
+    flat_target = target_tensor.reshape(-1)
+    if threshold == 0.0:
+        indices = torch.nonzero(flat_target != flat_base, as_tuple=False).flatten()
+    else:
+        delta = flat_target - flat_base
+        indices = torch.nonzero(delta.abs() > threshold, as_tuple=False).flatten()
+    values = (
+        flat_target.index_select(0, indices) - flat_base.index_select(0, indices)
+    ).contiguous().to(base_tensor.dtype)
+    return indices, values
+
+
+def _stream_layer_index(name: str) -> int | None:
+    marker = ".layers."
+    if marker not in name:
+        return None
+    layer = name.split(marker, 1)[1].split(".", 1)[0]
+    return int(layer) if layer.isdecimal() else None
+
+
+def _stream_record_order(name: str) -> tuple[int, int, str]:
+    layer_index = _stream_layer_index(name)
+    if layer_index is None:
+        return (0, 0, name)
+    return (1, layer_index, name)
+
+
+def _stream_group_id(name: str, group_size: int) -> int | None:
+    layer_index = _stream_layer_index(name)
+    if layer_index is None or group_size == 0:
+        return None
+    return layer_index // group_size
 
 
 def _validate_part_orders(name: str, orders: Iterable[int], expected: int) -> None:

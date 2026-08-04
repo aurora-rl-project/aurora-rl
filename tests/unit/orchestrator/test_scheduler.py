@@ -322,7 +322,7 @@ def test_streaming_background_stage_waits_for_delta_file_and_finalizes_on_stable
 
         step_path = Path("/tmp/prime-rl-test/broadcasts/step_8")
         assert calls == [
-            ("wait", step_path / "delta.safetensors"),
+            ("wait", step_path / "delta.stream"),
             ("stage", step_path, "8", "delta", "7", True, "streaming", step_path / "STABLE"),
         ]
 

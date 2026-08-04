@@ -174,7 +174,8 @@ def _stage_relay_file(path: Path, mode: str) -> Path:
     if path.is_file():
         return path
     if mode == "delta" and path.is_dir():
-        return path / "delta.safetensors"
+        stream_path = path / "delta.stream"
+        return stream_path if stream_path.exists() else path / "delta.safetensors"
     return path
 
 

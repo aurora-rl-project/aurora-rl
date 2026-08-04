@@ -470,6 +470,12 @@ class FileSystemWeightBroadcastConfig(BaseWeightBroadcastConfig):
     delta_index_encoding: Literal["optimized", "naive"] = "optimized"
     """Sparse delta index encoding used when ``mode='delta'``."""
 
+    delta_streaming_enabled: bool = False
+    """Write append-only sparse delta records so extraction can overlap upload."""
+
+    delta_stream_group_size: int = Field(4, ge=0)
+    """Number of transformer layers written per streaming delta flush. Zero flushes every record."""
+
     retain_all_deltas: bool = False
     """When ``mode='delta'``, keep every delta broadcast on disk so retired inference endpoints can replay the chain during recovery."""
 
@@ -477,6 +483,8 @@ class FileSystemWeightBroadcastConfig(BaseWeightBroadcastConfig):
     def validate_delta_options(self):
         if self.retain_all_deltas and self.mode != "delta":
             raise ValueError("retain_all_deltas requires mode='delta'.")
+        if self.delta_streaming_enabled and self.mode != "delta":
+            raise ValueError("delta_streaming_enabled requires mode='delta'.")
         return self
 
 

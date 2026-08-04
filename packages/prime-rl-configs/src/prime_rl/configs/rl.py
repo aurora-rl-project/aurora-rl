@@ -130,6 +130,9 @@ class SharedWeightBroadcastConfig(BaseConfig):
     retain_all_deltas: bool = False
     """When using filesystem delta mode, keep every delta broadcast so lease recovery can replay the full chain."""
 
+    delta_stream_group_size: int = Field(4, ge=0)
+    """Number of transformer layers written per streaming delta flush."""
+
     port: int = 29501
     """Port for NCCL weight broadcast."""
 
@@ -350,6 +353,8 @@ class RLConfig(BaseConfig):
                 self.trainer.weight_broadcast = TrainerFileSystemWeightBroadcastConfig(
                     mode=self.weight_broadcast.mode,
                     retain_all_deltas=self.weight_broadcast.retain_all_deltas,
+                    delta_streaming_enabled=self.weight_broadcast.stage_transport == "streaming_upload",
+                    delta_stream_group_size=self.weight_broadcast.delta_stream_group_size,
                 )
                 self.orchestrator.weight_broadcast = OrchestratorFileSystemWeightBroadcastConfig(
                     mode=self.weight_broadcast.mode,

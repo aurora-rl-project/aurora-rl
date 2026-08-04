@@ -18,7 +18,7 @@ from prime_rl.trainer.weights import (
     save_state_dict,
 )
 from prime_rl.trainer.world import get_world
-from prime_rl.utils.delta import ModelDeltaManager
+from prime_rl.utils.delta import SAFETENSORS_DELTA_FILENAME, STREAMING_DELTA_FILENAME, ModelDeltaManager
 from prime_rl.utils.utils import get_broadcast_dir, get_step_path
 
 
@@ -33,6 +33,8 @@ class FileSystemWeightBroadcast(WeightBroadcast):
         self.save_sharded = config.save_sharded if lora_config is None else False
         self.mode = config.mode
         self.delta_index_encoding = config.delta_index_encoding
+        self.delta_streaming_enabled = config.delta_streaming_enabled
+        self.delta_stream_group_size = config.delta_stream_group_size
         self.retain_all_deltas = config.retain_all_deltas
         self.world = get_world()
         self.multi_run_manager = get_multi_run_manager()
@@ -164,15 +166,26 @@ class FileSystemWeightBroadcast(WeightBroadcast):
             )
             base_state = self._initial_state
 
-        delta_path = save_dir / "delta.safetensors"
+        delta_filename = STREAMING_DELTA_FILENAME if self.delta_streaming_enabled else SAFETENSORS_DELTA_FILENAME
+        delta_path = save_dir / delta_filename
         self.logger.debug(f"Saving sparse delta for run {idx} to {delta_path}")
-        self.delta_manager.extract_sparse_delta_from_state_dicts(
-            base_state,
-            state_dict,
-            delta_path,
-            index_encoding=self.delta_index_encoding,
-            save_stats=True,
-        )
+        if self.delta_streaming_enabled:
+            self.delta_manager.extract_sparse_delta_streaming_from_state_dicts(
+                base_state,
+                state_dict,
+                delta_path,
+                group_size=self.delta_stream_group_size,
+                index_encoding=self.delta_index_encoding,
+                save_stats=True,
+            )
+        else:
+            self.delta_manager.extract_sparse_delta_from_state_dicts(
+                base_state,
+                state_dict,
+                delta_path,
+                index_encoding=self.delta_index_encoding,
+                save_stats=True,
+            )
         self._prev_state_by_run[idx] = state_dict
 
     def _notify_orchestrator(self, save_dir: Path):

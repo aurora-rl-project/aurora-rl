@@ -3,6 +3,12 @@ clean_output_dir = false
 max_steps = 3
 seq_len = 1024
 
+[wandb]
+project = "prime-rl-full-feature-e2e"
+name = "qwen3-0p6b-full-feature-relay-e2e"
+tags = ["e2e", "sparse-delta", "streaming", "relay", "load-balancing"]
+offline = false
+
 [deployment]
 num_train_gpus = 1
 num_infer_gpus = 0

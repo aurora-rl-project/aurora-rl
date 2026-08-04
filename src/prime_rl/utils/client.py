@@ -876,7 +876,11 @@ async def stage_weights(
         if upload_path.is_dir():
             if mode != "delta":
                 raise ValueError("upload=True requires a file path for full checkpoint staging")
-            upload_path = upload_path / "delta.safetensors"
+            preferred_name = "delta.stream" if upload_method == "streaming" else "delta.safetensors"
+            fallback_name = "delta.safetensors" if upload_method == "streaming" else "delta.stream"
+            preferred_path = upload_path / preferred_name
+            fallback_path = upload_path / fallback_name
+            upload_path = preferred_path if preferred_path.exists() or not fallback_path.exists() else fallback_path
         return upload_path
 
     def _sha256_file(path: Path) -> str:

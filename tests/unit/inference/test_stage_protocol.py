@@ -338,7 +338,7 @@ def test_relay_fail_on_peer_error_returns_502(tmp_path) -> None:
 def test_client_stage_streams_growing_delta_file(tmp_path) -> None:
     delta_dir = tmp_path / "step_1"
     delta_dir.mkdir()
-    delta_file = delta_dir / "delta.safetensors"
+    delta_file = delta_dir / "delta.stream"
     stable_file = delta_dir / "STABLE"
     app = make_app(tmp_path)
 

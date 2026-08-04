@@ -11,9 +11,12 @@ from prime_rl.utils.delta import (
     DELTA_METADATA_FORMAT_VALUE,
     DELTA_VALUE_SUFFIX,
     ModelDeltaManager,
+    count_sparse_delta_values,
     decode_sparse_indices,
     decode_varint_delta_indices,
     encode_varint_delta_indices,
+    is_streaming_delta_file,
+    iter_streaming_delta_records,
     verify_sparse_delta_file,
     verify_sparse_delta_state_dicts,
 )
@@ -112,6 +115,47 @@ def test_sparse_delta_uses_fused_names_with_uneven_qkv_parts(tmp_path) -> None:
         qkv_indices = decode_sparse_indices(delta.get_tensor(qkv_idx_key), qkv_values.numel())
         assert qkv_indices.tolist() == [3, 5, 6]
         assert qkv_values.tolist() == [10.0, 20.0, -1.0]
+
+
+@pytest.mark.parametrize(
+    ("index_encoding", "index_dtype"),
+    [("optimized", torch.uint8), ("naive", torch.int32)],
+)
+def test_streaming_sparse_delta_round_trips_fused_tensors(
+    tmp_path,
+    index_encoding: str,
+    index_dtype: torch.dtype,
+) -> None:
+    base = {
+        "model.layers.0.self_attn.q_proj.weight": torch.zeros((2, 2)),
+        "model.layers.0.self_attn.k_proj.weight": torch.zeros((1, 2)),
+        "model.layers.0.self_attn.v_proj.weight": torch.zeros((1, 2)),
+        "model.norm.weight": torch.ones(2),
+    }
+    target = {name: tensor.clone() for name, tensor in base.items()}
+    target["model.layers.0.self_attn.q_proj.weight"][1, 1] = 10.0
+    target["model.layers.0.self_attn.k_proj.weight"][0, 1] = 20.0
+    target["model.layers.0.self_attn.v_proj.weight"][0, 0] = -1.0
+    delta_path = tmp_path / "delta.stream"
+
+    stats = ModelDeltaManager().extract_sparse_delta_streaming_from_state_dicts(
+        base,
+        target,
+        delta_path,
+        group_size=4,
+        index_encoding=index_encoding,
+        save_stats=True,
+    )
+
+    records = list(iter_streaming_delta_records(delta_path))
+    assert is_streaming_delta_file(delta_path)
+    assert stats is not None and stats.changed_params == 3
+    assert count_sparse_delta_values(delta_path) == 3
+    assert verify_sparse_delta_state_dicts(base, target, delta_path).ok
+    assert [record.name for record in records] == ["model.layers.0.self_attn.qkv_proj.weight"]
+    assert records[0].encoded_indices.dtype == index_dtype
+    assert records[0].values.tolist() == [10.0, 20.0, -1.0]
+    assert decode_sparse_indices(records[0].encoded_indices, 3).tolist() == [3, 5, 6]
 
 
 def test_tied_lm_head_is_skipped(tmp_path) -> None:

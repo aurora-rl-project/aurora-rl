@@ -424,7 +424,7 @@ class Scheduler:
 
     def _stage_ready_path(self, weights_path: Path, stable_path: Path) -> Path:
         if self._weight_stage_transport() == "streaming_upload" and self._weight_update_mode() == "delta":
-            return weights_path / "delta.safetensors"
+            return weights_path / "delta.stream"
         return stable_path
 
     async def _apply_policy_update(self, next_ckpt_step: int) -> None:

@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 import prime_rl.trainer.rl.broadcast.filesystem as filesystem_module
@@ -8,7 +9,16 @@ from prime_rl.trainer.rl.broadcast.filesystem import FileSystemWeightBroadcast
 from prime_rl.utils.delta import verify_sparse_delta_state_dicts
 
 
-def test_filesystem_delta_broadcast_writes_base_and_delta(tmp_path, monkeypatch) -> None:
+@pytest.mark.parametrize(
+    ("streaming", "delta_filename"),
+    [(False, "delta.safetensors"), (True, "delta.stream")],
+)
+def test_filesystem_delta_broadcast_writes_base_and_delta(
+    tmp_path,
+    monkeypatch,
+    streaming: bool,
+    delta_filename: str,
+) -> None:
     manager = SimpleNamespace(
         used_idxs=[0],
         ready_to_update_idxs=[0],
@@ -24,7 +34,11 @@ def test_filesystem_delta_broadcast_writes_base_and_delta(tmp_path, monkeypatch)
 
     broadcast = FileSystemWeightBroadcast(
         tmp_path,
-        FileSystemWeightBroadcastConfig(mode="delta", save_sharded=False),
+        FileSystemWeightBroadcastConfig(
+            mode="delta",
+            save_sharded=False,
+            delta_streaming_enabled=streaming,
+        ),
     )
     base = {"linear.weight": torch.zeros((2, 2))}
     target = {"linear.weight": torch.tensor([[0.0, 1.0], [0.0, 2.0]])}
@@ -37,7 +51,7 @@ def test_filesystem_delta_broadcast_writes_base_and_delta(tmp_path, monkeypatch)
 
     base_dir = tmp_path / "broadcasts" / "step_0"
     delta_dir = tmp_path / "broadcasts" / "step_1"
-    delta_path = delta_dir / "delta.safetensors"
+    delta_path = delta_dir / delta_filename
 
     assert (base_dir / "model.safetensors").exists()
     assert (base_dir / "STABLE").exists()

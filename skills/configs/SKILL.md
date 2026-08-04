@@ -70,6 +70,22 @@ For rollout debugging, enable trainer-side token export under `trainer.experimen
 
 Leave it unset for normal training. When enabled, it exports every sequence from each exporting rank.
 
+## Streaming sparse deltas
+
+At the shared RL config level, `stage_transport = "streaming_upload"` automatically enables trainer-side streaming delta extraction. The trainer writes append-only records to `delta.stream`, allowing extraction, file output, and HTTP upload to overlap. `delta_stream_group_size` controls the number of transformer layers between flushes and defaults to 4.
+
+```toml
+[weight_broadcast]
+type = "filesystem"
+mode = "delta"
+update_protocol = "stage_commit"
+stage_transport = "streaming_upload"
+background_stage = true
+delta_stream_group_size = 4
+```
+
+When configuring the trainer entrypoint directly instead of using the shared RL config, set `weight_broadcast.delta_streaming_enabled = true` explicitly. Non-streaming extraction writes `delta.safetensors`; streaming extraction writes `delta.stream`.
+
 ## Key files
 
 - `packages/prime-rl-configs/src/prime_rl/` — config classes under `configs/`; `utils/config.py` re-exports `BaseConfig` and `cli`

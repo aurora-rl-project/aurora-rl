@@ -251,6 +251,8 @@ def test_shared_filesystem_delta_weight_broadcast_mode_propagates():
     assert config.orchestrator.weight_broadcast.stage_transport == "streaming_upload"
     assert config.orchestrator.weight_broadcast.background_stage is True
     assert config.trainer.weight_broadcast.retain_all_deltas is True
+    assert config.trainer.weight_broadcast.delta_streaming_enabled is True
+    assert config.trainer.weight_broadcast.delta_stream_group_size == 4
 
 
 def test_inference_relay_config_translates_to_vllm_namespace():

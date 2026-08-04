@@ -8,7 +8,14 @@ from vllm.config import set_current_vllm_config
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.reload import finalize_layerwise_reload, initialize_layerwise_reload
 
-from prime_rl.utils.delta import DELTA_INDEX_SUFFIX, DELTA_VALUE_SUFFIX, decode_sparse_indices, is_sparse_delta_store
+from prime_rl.utils.delta import (
+    DELTA_INDEX_SUFFIX,
+    DELTA_VALUE_SUFFIX,
+    decode_sparse_indices,
+    is_sparse_delta_store,
+    is_streaming_delta_file,
+    iter_streaming_delta_records,
+)
 
 logger = init_logger("vllm.inference.vllm.worker_weight_transfer")
 
@@ -29,12 +36,34 @@ def load_weights_checkpoint_layerwise(
 
 @torch.no_grad()
 def load_sparse_delta_weights(model: Module, delta_path: str, scale_factor: float = 1.0) -> None:
-    """Apply a sparse delta safetensors file to the current model weights in-place."""
+    """Apply a sparse delta file to the current model weights in-place."""
     params = dict(model.named_parameters())
     start_time = time.perf_counter()
     updated = 0
     delta_values = 0
     full_tensor_updates = 0
+
+    if is_streaming_delta_file(delta_path):
+        seen: set[str] = set()
+        for record in iter_streaming_delta_records(delta_path):
+            if record.name in seen:
+                raise ValueError(f"duplicate sparse delta tensor: {record.name}")
+            seen.add(record.name)
+            param = params.get(record.name)
+            if param is None:
+                raise ValueError(f"delta parameter is not present in the vLLM model: {record.name}")
+            full_tensor = _apply_sparse_delta_tensor(
+                param,
+                record.name,
+                record.encoded_indices,
+                record.values,
+                scale_factor,
+            )
+            updated += 1
+            delta_values += record.values.numel()
+            full_tensor_updates += int(full_tensor)
+        _log_sparse_delta_apply(delta_path, start_time, updated, delta_values, full_tensor_updates)
+        return
 
     with safe_open(delta_path, framework="pt", device="cpu") as delta:
         delta_keys = set(delta.keys())
@@ -60,28 +89,55 @@ def load_sparse_delta_weights(model: Module, delta_path: str, scale_factor: floa
         logger.info(f"Applying sparse delta from {delta_path} ({len(idx_names)} tensors)")
         for name in sorted(idx_names):
             param = params[name]
-            flat = param.data.reshape(-1)
             values_cpu = delta.get_tensor(f"{name}{DELTA_VALUE_SUFFIX}").reshape(-1)
-            indices = decode_sparse_indices(delta.get_tensor(f"{name}{DELTA_INDEX_SUFFIX}"), values_cpu.numel())
-            if indices.numel() == 0:
-                continue
-
-            if int(indices[0].item()) < 0 or int(indices[-1].item()) >= flat.numel():
-                raise ValueError(f"sparse delta index out of range for {name}")
-
-            values = values_cpu.to(device=flat.device, dtype=flat.dtype)
-            if scale_factor != 1.0:
-                values = values * scale_factor
-
-            if _indices_cover_flat_tensor(indices, flat.numel()):
-                flat.add_(values)
-                full_tensor_updates += 1
-            else:
-                flat.index_add_(0, indices.to(device=flat.device), values)
-
+            full_tensor = _apply_sparse_delta_tensor(
+                param,
+                name,
+                delta.get_tensor(f"{name}{DELTA_INDEX_SUFFIX}"),
+                values_cpu,
+                scale_factor,
+            )
             updated += 1
             delta_values += values_cpu.numel()
+            full_tensor_updates += int(full_tensor)
 
+
+    _log_sparse_delta_apply(delta_path, start_time, updated, delta_values, full_tensor_updates)
+
+
+def _apply_sparse_delta_tensor(
+    param: torch.nn.Parameter,
+    name: str,
+    encoded_indices: torch.Tensor,
+    values_cpu: torch.Tensor,
+    scale_factor: float,
+) -> bool:
+    flat = param.data.reshape(-1)
+    values_cpu = values_cpu.reshape(-1)
+    indices = decode_sparse_indices(encoded_indices, values_cpu.numel())
+    if indices.numel() == 0:
+        return False
+    if int(indices[0].item()) < 0 or int(indices[-1].item()) >= flat.numel():
+        raise ValueError(f"sparse delta index out of range for {name}")
+
+    values = values_cpu.to(device=flat.device, dtype=flat.dtype)
+    if scale_factor != 1.0:
+        values = values * scale_factor
+    full_tensor = _indices_cover_flat_tensor(indices, flat.numel())
+    if full_tensor:
+        flat.add_(values)
+    else:
+        flat.index_add_(0, indices.to(device=flat.device), values)
+    return full_tensor
+
+
+def _log_sparse_delta_apply(
+    delta_path: str,
+    start_time: float,
+    updated: int,
+    delta_values: int,
+    full_tensor_updates: int,
+) -> None:
     logger.info(
         f"Applied sparse delta to {updated} tensors ({delta_values} values, "
         f"{full_tensor_updates} full-tensor updates) in {time.perf_counter() - start_time:.2f}s"

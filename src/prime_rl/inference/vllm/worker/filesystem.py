@@ -56,7 +56,8 @@ class FileSystemWeightUpdateWorker(Worker):
         """Apply a sparse delta file to the current vLLM model weights."""
         path = Path(delta_path)
         if path.is_dir():
-            path = path / "delta.safetensors"
+            stream_path = path / "delta.stream"
+            path = stream_path if stream_path.exists() else path / "delta.safetensors"
         model = self._model()
         load_sparse_delta_weights(model, path.as_posix())
         update_mla_absorbed_weights(model)
