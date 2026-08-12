@@ -101,7 +101,6 @@ def load_sparse_delta_weights(model: Module, delta_path: str, scale_factor: floa
             delta_values += values_cpu.numel()
             full_tensor_updates += int(full_tensor)
 
-
     _log_sparse_delta_apply(delta_path, start_time, updated, delta_values, full_tensor_updates)
 
 

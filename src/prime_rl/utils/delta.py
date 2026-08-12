@@ -1011,9 +1011,7 @@ def _validated_model_keys(base: TensorStore, target: TensorStore, *, include_bia
 
 def _validate_tensor_pair(name: str, base_tensor: torch.Tensor, target_tensor: torch.Tensor) -> None:
     if base_tensor.shape != target_tensor.shape:
-        raise ValueError(
-            f"shape mismatch for {name}: {tuple(base_tensor.shape)} vs {tuple(target_tensor.shape)}"
-        )
+        raise ValueError(f"shape mismatch for {name}: {tuple(base_tensor.shape)} vs {tuple(target_tensor.shape)}")
 
 
 def _extract_changed_values(
@@ -1030,8 +1028,8 @@ def _extract_changed_values(
         delta = flat_target - flat_base
         indices = torch.nonzero(delta.abs() > threshold, as_tuple=False).flatten()
     values = (
-        flat_target.index_select(0, indices) - flat_base.index_select(0, indices)
-    ).contiguous().to(base_tensor.dtype)
+        (flat_target.index_select(0, indices) - flat_base.index_select(0, indices)).contiguous().to(base_tensor.dtype)
+    )
     return indices, values
 
 
