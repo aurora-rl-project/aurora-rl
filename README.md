@@ -5,6 +5,8 @@ separated by slow or long-distance networks. It adds sparse delta weight
 updates, HTTP streaming stage/commit, multi-endpoint inference, load-aware
 routing, endpoint recovery, and regional relay fan-out.
 
+The full version will be released after the camera-ready.
+
 ## Features
 
 - Exact sparse deltas with compact index encoding.
