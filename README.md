@@ -122,6 +122,20 @@ to `delta.stream` and uploaded while later layers are still being scanned.
 between file flushes. Other stage transports continue to use standard
 `delta.safetensors` files.
 
+Sparse-delta v2 artifacts preserve logical Hugging Face parameter names and
+global tensor shapes after the existing trainer-side state-dict gather, so the
+artifact is independent of the trainer's FSDP partitioning. Each inference
+worker maps those updates to its local vLLM layout, including fused QKV and
+gate/up projections, replicated weights, and row-, column-, and
+vocabulary-parallel TP shards. It supports unquantized
+dense decoder models with Qwen3/Llama-style Hugging Face names and vLLM weight
+layouts, including grouped-query attention with replicated KV heads. The TP
+world size is not fixed: any vLLM-valid TP configuration is supported when the
+model's dimensions and attention heads satisfy the corresponding sharding
+constraints. Legacy v1 artifacts remain readable. Quantized or packed weights,
+MoE/expert-parallel layouts, nonstandard fused-weight conventions, and
+pipeline-parallel loading are outside the current adapter.
+
 ### Multi-endpoint Routing
 
 ```toml

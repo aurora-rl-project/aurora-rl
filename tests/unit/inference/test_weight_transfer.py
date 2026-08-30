@@ -1,8 +1,17 @@
+import struct
+
 import pytest
 import torch
+from safetensors.torch import save_file
 
 from prime_rl.inference.vllm.worker.weight_transfer import load_sparse_delta_weights
-from prime_rl.utils.delta import ModelDeltaManager
+from prime_rl.utils.delta import (
+    DELTA_INDEX_SUFFIX,
+    DELTA_METADATA_FORMAT_KEY,
+    DELTA_METADATA_FORMAT_V1,
+    DELTA_VALUE_SUFFIX,
+    ModelDeltaManager,
+)
 
 
 @pytest.mark.parametrize("streaming", [False, True])
@@ -73,3 +82,46 @@ def test_load_sparse_delta_weights_applies_streaming_delta(tmp_path) -> None:
     load_sparse_delta_weights(module, delta_path.as_posix())
 
     assert torch.equal(module.weight, target["weight"])
+
+
+def test_load_sparse_delta_weights_accepts_legacy_v1_safetensors(tmp_path) -> None:
+    module = torch.nn.Linear(2, 2, bias=False)
+    with torch.no_grad():
+        module.weight.zero_()
+    delta_path = tmp_path / "delta.safetensors"
+    save_file(
+        {
+            f"weight{DELTA_INDEX_SUFFIX}": torch.tensor([1, 3], dtype=torch.int32),
+            f"weight{DELTA_VALUE_SUFFIX}": torch.tensor([2.0, 4.0]),
+        },
+        delta_path,
+        metadata={DELTA_METADATA_FORMAT_KEY: DELTA_METADATA_FORMAT_V1},
+    )
+
+    load_sparse_delta_weights(module, delta_path.as_posix())
+
+    assert torch.equal(module.weight, torch.tensor([[0.0, 2.0], [0.0, 4.0]]))
+
+
+def test_load_sparse_delta_weights_accepts_legacy_v1_stream(tmp_path) -> None:
+    module = torch.nn.Linear(2, 2, bias=False)
+    with torch.no_grad():
+        module.weight.zero_()
+    delta_path = tmp_path / "delta.stream"
+    name = b"weight"
+    indices = torch.tensor([1, 3], dtype=torch.int32)
+    values = torch.tensor([2.0, 4.0], dtype=torch.float32)
+    payload = b"".join(
+        (
+            struct.pack("<8sI", b"PDELSTRM", 1),
+            struct.pack("<I B B H Q Q", len(name), 1, 3, 0, indices.nbytes, values.numel()),
+            name,
+            indices.numpy().tobytes(),
+            values.numpy().tobytes(),
+        )
+    )
+    delta_path.write_bytes(payload)
+
+    load_sparse_delta_weights(module, delta_path.as_posix())
+
+    assert torch.equal(module.weight, torch.tensor([[0.0, 2.0], [0.0, 4.0]]))

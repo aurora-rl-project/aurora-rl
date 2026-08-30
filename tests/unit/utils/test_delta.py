@@ -9,6 +9,8 @@ from prime_rl.utils.delta import (
     DELTA_INDEX_SUFFIX,
     DELTA_METADATA_FORMAT_KEY,
     DELTA_METADATA_FORMAT_VALUE,
+    DELTA_METADATA_LAYOUT_KEY,
+    DELTA_METADATA_SHAPES_KEY,
     DELTA_VALUE_SUFFIX,
     ModelDeltaManager,
     count_sparse_delta_values,
@@ -109,7 +111,7 @@ def test_sparse_delta_from_identical_state_dicts_creates_verifiable_empty_delta(
         assert delta.metadata()[DELTA_METADATA_FORMAT_KEY] == DELTA_METADATA_FORMAT_VALUE
 
 
-def test_sparse_delta_uses_fused_names_with_uneven_qkv_parts(tmp_path) -> None:
+def test_sparse_delta_preserves_logical_names_and_shapes(tmp_path) -> None:
     base = {
         "model.layers.0.self_attn.q_proj.weight": torch.zeros((2, 2)),
         "model.layers.0.self_attn.k_proj.weight": torch.zeros((1, 2)),
@@ -131,23 +133,31 @@ def test_sparse_delta_uses_fused_names_with_uneven_qkv_parts(tmp_path) -> None:
     assert result.ok
     with safe_open(delta_path, framework="pt", device="cpu") as delta:
         keys = set(delta.keys())
-        qkv_idx_key = f"model.layers.0.self_attn.qkv_proj.weight{DELTA_INDEX_SUFFIX}"
-        qkv_val_key = f"model.layers.0.self_attn.qkv_proj.weight{DELTA_VALUE_SUFFIX}"
-        assert qkv_idx_key in keys
-        assert qkv_val_key in keys
-        assert f"model.layers.0.self_attn.q_proj.weight{DELTA_INDEX_SUFFIX}" not in keys
+        q_name = "model.layers.0.self_attn.q_proj.weight"
+        k_name = "model.layers.0.self_attn.k_proj.weight"
+        v_name = "model.layers.0.self_attn.v_proj.weight"
+        assert f"{q_name}{DELTA_INDEX_SUFFIX}" in keys
+        assert f"{k_name}{DELTA_INDEX_SUFFIX}" in keys
+        assert f"{v_name}{DELTA_INDEX_SUFFIX}" in keys
+        assert f"model.layers.0.self_attn.qkv_proj.weight{DELTA_INDEX_SUFFIX}" not in keys
 
-        qkv_values = delta.get_tensor(qkv_val_key)
-        qkv_indices = decode_sparse_indices(delta.get_tensor(qkv_idx_key), qkv_values.numel())
-        assert qkv_indices.tolist() == [3, 5, 6]
-        assert qkv_values.tolist() == [10.0, 20.0, -1.0]
+        q_values = delta.get_tensor(f"{q_name}{DELTA_VALUE_SUFFIX}")
+        q_indices = decode_sparse_indices(delta.get_tensor(f"{q_name}{DELTA_INDEX_SUFFIX}"), q_values.numel())
+        assert q_indices.tolist() == [3]
+        assert q_values.tolist() == [10.0]
+        metadata = delta.metadata()
+        assert metadata[DELTA_METADATA_LAYOUT_KEY] == "huggingface"
+        shapes = json.loads(metadata[DELTA_METADATA_SHAPES_KEY])
+        assert shapes[q_name] == [2, 2]
+        assert shapes[k_name] == [1, 2]
+        assert shapes[v_name] == [1, 2]
 
 
 @pytest.mark.parametrize(
     ("index_encoding", "index_dtype"),
     [("optimized", torch.uint8), ("naive", torch.int32)],
 )
-def test_streaming_sparse_delta_round_trips_fused_tensors(
+def test_streaming_sparse_delta_round_trips_logical_tensors(
     tmp_path,
     index_encoding: str,
     index_dtype: torch.dtype,
@@ -178,10 +188,16 @@ def test_streaming_sparse_delta_round_trips_fused_tensors(
     assert stats is not None and stats.changed_params == 3
     assert count_sparse_delta_values(delta_path) == 3
     assert verify_sparse_delta_state_dicts(base, target, delta_path).ok
-    assert [record.name for record in records] == ["model.layers.0.self_attn.qkv_proj.weight"]
-    assert records[0].encoded_indices.dtype == index_dtype
-    assert records[0].values.tolist() == [10.0, 20.0, -1.0]
-    assert decode_sparse_indices(records[0].encoded_indices, 3).tolist() == [3, 5, 6]
+    assert [record.name for record in records] == [
+        "model.layers.0.self_attn.k_proj.weight",
+        "model.layers.0.self_attn.q_proj.weight",
+        "model.layers.0.self_attn.v_proj.weight",
+    ]
+    assert all(record.format_version == 2 for record in records)
+    assert all(record.encoded_indices.dtype == index_dtype for record in records)
+    assert [record.shape for record in records] == [(1, 2), (2, 2), (1, 2)]
+    assert [record.values.tolist() for record in records] == [[20.0], [10.0], [-1.0]]
+    assert [decode_sparse_indices(record.encoded_indices, 1).tolist() for record in records] == [[1], [3], [0]]
 
 
 def test_tied_lm_head_is_skipped(tmp_path) -> None:

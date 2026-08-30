@@ -55,12 +55,8 @@ class FileSystemWeightUpdateWorker(Worker):
     def update_weights_from_delta_path(self, delta_path: str) -> None:
         """Apply a sparse delta file to the current vLLM model weights."""
         parallel = self.vllm_config.parallel_config
-        if (
-            parallel.tensor_parallel_size != 1
-            or parallel.pipeline_parallel_size != 1
-            or parallel.enable_expert_parallel
-        ):
-            raise ValueError("sparse deltas require unsharded inference parameters (TP=1, PP=1, no expert parallelism)")
+        if parallel.pipeline_parallel_size != 1 or parallel.enable_expert_parallel:
+            raise ValueError("sparse deltas require PP=1 and no expert parallelism")
         if self.model_runner.model_config.quantization is not None:
             raise ValueError("sparse deltas do not support quantized inference weights")
         path = Path(delta_path)

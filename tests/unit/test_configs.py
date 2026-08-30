@@ -286,7 +286,6 @@ def test_inference_relay_config_translates_to_vllm_namespace():
         ({"ckpt": {"resume_step": 3}}, "cannot resume"),
         ({"ckpt": {"resume_step": -1}}, "cannot resume"),
         ({"ckpt": {"resume_step": 0}}, "cannot resume"),
-        ({"inference": {"parallel": {"tp": 2}}}, "tp=1"),
         ({"inference": {"api_server_count": 2}}, "single inference API server"),
     ],
 )
@@ -300,6 +299,21 @@ def test_delta_rejects_unsynchronized_runtime_configs(overrides, message):
     config.update(overrides)
     with pytest.raises(ValidationError, match=message):
         RLConfig.model_validate(config)
+
+
+def test_delta_accepts_tensor_parallel_inference():
+    config = RLConfig.model_validate(
+        {
+            "weight_broadcast": {"type": "filesystem", "mode": "delta", "update_protocol": "stage_commit"},
+            "trainer": {},
+            "orchestrator": {"renderer": None},
+            "inference": {"parallel": {"tp": 2}},
+            "deployment": {"num_infer_gpus": 2},
+        }
+    )
+
+    assert config.inference is not None
+    assert config.inference.parallel.tp == 2
 
 
 def test_orchestrator_load_balancing_config_defaults_and_overrides():

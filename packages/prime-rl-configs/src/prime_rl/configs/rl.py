@@ -381,8 +381,6 @@ class RLConfig(BaseConfig):
                 raise ValueError(
                     "delta weight updates cannot resume without a synchronized full checkpoint; use mode='full'."
                 )
-        if self.inference is not None and self.inference.parallel.tp != 1:
-            raise ValueError("sparse delta weight updates require inference.parallel.tp=1.")
         if (
             self.inference is not None
             and self.orchestrator.weight_broadcast.type == "filesystem"
