@@ -4,6 +4,11 @@
 *.ipynb
 *.jsonl
 configs/endpoints.py
+.DS_Store
+/blog/
+/sparrow-rl-pilot/
+/sparrowrl-blog-standalone.html
+/sparrowrl-paper/
 
 # Artifacts
 **/slurm
