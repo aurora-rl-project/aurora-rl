@@ -236,6 +236,12 @@ class Scheduler:
         """
         clients = self.rollout_inference.train_clients
         while not clients:
+            recover = getattr(self.rollout_inference, "recover_unhealthy_endpoints", None)
+            if recover is not None:
+                await recover()
+                clients = self.rollout_inference.train_clients
+                if clients:
+                    break
             await asyncio.sleep(1)
             clients = self.rollout_inference.train_clients
         inflight = Counter(self._client_identity(info.client_config) for info in self.inflight_requests.values())

@@ -47,7 +47,8 @@ def test_varint_delta_indices_reject_unsorted_indices() -> None:
         encode_varint_delta_indices(torch.tensor([2, 1], dtype=torch.int64))
 
 
-def test_sparse_delta_from_state_dicts_round_trips_and_skips_bias(tmp_path) -> None:
+@pytest.mark.parametrize("streaming", [False, True])
+def test_sparse_delta_from_state_dicts_round_trips_bias(tmp_path, streaming) -> None:
     base = {
         "linear.weight": torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
         "linear.bias": torch.tensor([1.0, 1.0]),
@@ -58,15 +59,40 @@ def test_sparse_delta_from_state_dicts_round_trips_and_skips_bias(tmp_path) -> N
     }
     delta_path = tmp_path / "delta.safetensors"
 
-    ModelDeltaManager().extract_sparse_delta_from_state_dicts(base, target, delta_path)
+    manager = ModelDeltaManager()
+    extract = (
+        manager.extract_sparse_delta_streaming_from_state_dicts
+        if streaming
+        else manager.extract_sparse_delta_from_state_dicts
+    )
+    extract(base, target, delta_path)
 
     result = verify_sparse_delta_state_dicts(base, target, delta_path)
     assert result.ok
+    if streaming:
+        assert {record.name for record in iter_streaming_delta_records(delta_path)} == {"linear.weight", "linear.bias"}
+        return
     with safe_open(delta_path, framework="pt", device="cpu") as delta:
         keys = set(delta.keys())
         assert f"linear.weight{DELTA_INDEX_SUFFIX}" in keys
         assert f"linear.weight{DELTA_VALUE_SUFFIX}" in keys
-        assert f"linear.bias{DELTA_INDEX_SUFFIX}" not in keys
+        assert f"linear.bias{DELTA_INDEX_SUFFIX}" in keys
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("streaming", [False, True])
+def test_sparse_delta_preserves_target_bits_across_sign_changes(tmp_path, dtype, streaming) -> None:
+    base = {"weight": torch.tensor([1.0, 0.0], dtype=dtype)}
+    target = {"weight": torch.tensor([-0.001, 0.0], dtype=dtype)}
+    delta_path = tmp_path / "delta"
+    manager = ModelDeltaManager()
+    extract = (
+        manager.extract_sparse_delta_streaming_from_state_dicts
+        if streaming
+        else manager.extract_sparse_delta_from_state_dicts
+    )
+    extract(base, target, delta_path)
+    assert verify_sparse_delta_state_dicts(base, target, delta_path, atol=0, rtol=0).ok
 
 
 def test_sparse_delta_from_identical_state_dicts_creates_verifiable_empty_delta(tmp_path) -> None:

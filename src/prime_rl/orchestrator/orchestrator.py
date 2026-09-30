@@ -289,6 +289,10 @@ async def orchestrate(config: OrchestratorConfig):
     progress = Progress()
 
     if checkpoint_step is not None and ckpt_manager is not None:
+        if getattr(config.weight_broadcast, "mode", "full") == "delta":
+            raise ValueError(
+                "delta weight updates cannot resume without a synchronized full checkpoint; use mode='full'"
+            )
         ckpt_manager.load(progress, buffer, step=checkpoint_step)
         logger.info(f"Resuming training from checkpoint step {checkpoint_step}")
         scheduler.ckpt_step = progress.step  # Always resume from the latest checkpoint

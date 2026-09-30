@@ -14,7 +14,7 @@ def main() -> None:
     parser.add_argument("--atol", type=float, default=1e-6)
     parser.add_argument("--rtol", type=float, default=1e-5)
     parser.add_argument("--max-report", type=int, default=10)
-    parser.add_argument("--include-bias", action="store_true")
+    parser.add_argument("--include-bias", action=argparse.BooleanOptionalAction, default=True)
     args = parser.parse_args()
 
     result = verify_sparse_delta_file(

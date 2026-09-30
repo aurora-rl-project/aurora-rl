@@ -111,22 +111,28 @@ def _apply_sparse_delta_tensor(
     values_cpu: torch.Tensor,
     scale_factor: float,
 ) -> bool:
-    flat = param.data.reshape(-1)
+    if not param.is_contiguous():
+        raise ValueError(f"sparse delta requires a contiguous parameter: {name}")
+    flat = param.data.view(-1)
     values_cpu = values_cpu.reshape(-1)
     indices = decode_sparse_indices(encoded_indices, values_cpu.numel())
     if indices.numel() == 0:
         return False
-    if int(indices[0].item()) < 0 or int(indices[-1].item()) >= flat.numel():
+    if int(indices.min().item()) < 0 or int(indices.max().item()) >= flat.numel():
         raise ValueError(f"sparse delta index out of range for {name}")
+    if indices.numel() > 1 and bool(torch.any(indices[1:] <= indices[:-1])):
+        raise ValueError(f"sparse delta indices must be strictly increasing for {name}")
 
-    values = values_cpu.to(device=flat.device, dtype=flat.dtype)
+    values = values_cpu.to(device=flat.device)
     if scale_factor != 1.0:
         values = values * scale_factor
     full_tensor = _indices_cover_flat_tensor(indices, flat.numel())
-    if full_tensor:
+    if full_tensor and values.dtype == flat.dtype:
         flat.add_(values)
     else:
-        flat.index_add_(0, indices.to(device=flat.device), values)
+        indices = indices.to(device=flat.device)
+        updated = flat.index_select(0, indices).to(torch.promote_types(flat.dtype, values.dtype)) + values
+        flat.index_copy_(0, indices, updated.to(flat.dtype))
     return full_tensor
 
 

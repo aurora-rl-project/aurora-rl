@@ -33,6 +33,10 @@ The `envs` extra installs every env workspace listed in `[tool.uv.workspace]`. A
 
 When bumping a package past the workspace-wide `exclude-newer = "7 days"` window, add it (and any newly-required transitives) to `[tool.uv.exclude-newer-package]` before refreshing `uv.lock`.
 
+If uv rejects the relative `exclude-newer = "7 days"` setting, update uv before syncing; older versions such as 0.8.3 cannot parse it. Do not weaken the repository's dependency cutoff to work around an old installer.
+
+The full runtime requires Linux/CUDA wheels and cannot be validated by syncing on macOS. For CPU-only review, use an isolated temporary environment with `uv --no-config run --no-project --python 3.12 --with ...`, and expose `src` plus `packages/prime-rl-configs/src` on `PYTHONPATH`. Keep it separate from `.venv`. Checks that exclude vLLM initialization validate the codec and HTTP protocol only, not actual worker RPCs, CUDA execution, or multi-region throughput. Run those integration checks on a Linux GPU host.
+
 ## Optional extras
 
 ### NemotronH (Mamba SSD kernels)

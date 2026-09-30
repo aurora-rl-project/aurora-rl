@@ -49,6 +49,22 @@ def make_scheduler() -> Scheduler:
     return scheduler
 
 
+def test_select_client_recovers_when_entire_pool_is_quarantined():
+    async def run() -> None:
+        scheduler = make_scheduler()
+        client = vf.ClientConfig(api_base_url="http://test/v1")
+        pool = SimpleNamespace(train_clients=[])
+
+        async def recover():
+            pool.train_clients = [client]
+
+        pool.recover_unhealthy_endpoints = recover
+        scheduler.rollout_inference = pool
+        assert await asyncio.wait_for(scheduler._select_least_loaded_client(), timeout=1) is client
+
+    asyncio.run(run())
+
+
 def test_update_off_policy_does_not_increment_interleaved_on_policy_tasks():
     async def run() -> None:
         scheduler = Scheduler.__new__(Scheduler)

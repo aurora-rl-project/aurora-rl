@@ -492,10 +492,11 @@ def reconstruct_sparse_delta_tensor(
         raise ValueError("sparse delta index out of range")
 
     indices = indices.to(device=flat.device)
-    delta_values = values.reshape(-1).to(device=flat.device, dtype=base_tensor.dtype)
+    delta_values = values.reshape(-1).to(device=flat.device)
     if scale_factor != 1.0:
         delta_values = delta_values * scale_factor
-    flat.index_add_(0, indices, delta_values)
+    updated = flat.index_select(0, indices).to(torch.promote_types(flat.dtype, delta_values.dtype)) + delta_values
+    flat.index_copy_(0, indices, updated.to(flat.dtype))
     return flat.reshape_as(base_tensor)
 
 
@@ -507,7 +508,7 @@ def verify_sparse_delta_file(
     atol: float = 1e-6,
     rtol: float = 1e-5,
     max_report: int = 10,
-    include_bias: bool = False,
+    include_bias: bool = True,
 ) -> DeltaVerificationResult:
     with (
         safe_open(base_model_path, framework="pt", device="cpu") as base,
@@ -575,7 +576,7 @@ def verify_sparse_delta_state_dicts(
     atol: float = 1e-6,
     rtol: float = 1e-5,
     max_report: int = 10,
-    include_bias: bool = False,
+    include_bias: bool = True,
 ) -> DeltaVerificationResult:
     base = StateDictTensorStore(base_state)
     target = StateDictTensorStore(target_state)
@@ -598,7 +599,7 @@ def verify_sparse_delta_stores(
     atol: float = 1e-6,
     rtol: float = 1e-5,
     max_report: int = 10,
-    include_bias: bool = False,
+    include_bias: bool = True,
 ) -> DeltaVerificationResult:
     base_keys = set(base.keys())
     target_keys = set(target.keys())
@@ -689,7 +690,7 @@ class ModelDeltaManager:
                 target,
                 delta_output_path,
                 index_encoding=index_encoding,
-                include_bias=False,
+                include_bias=True,
                 threshold=0.0,
                 collect_stats=save_stats,
             )
@@ -708,7 +709,7 @@ class ModelDeltaManager:
             StateDictTensorStore(finetuned_state),
             delta_output_path,
             index_encoding=index_encoding,
-            include_bias=False,
+            include_bias=True,
             threshold=0.0,
             collect_stats=save_stats,
         )
@@ -903,8 +904,8 @@ class ModelDeltaManager:
         if group_size < 0:
             raise ValueError("streaming delta group_size must be non-negative")
 
-        keys = _validated_model_keys(base, target, include_bias=False)
-        fused_parts, _parts_expected, single_keys = build_fused_groups(keys)
+        keys = _validated_model_keys(base, target, include_bias=True)
+        fused_parts, _parts_expected, single_keys = build_fused_groups(keys, include_bias=True)
         record_names = sorted(set(fused_parts) | single_keys, key=_stream_record_order)
         total_params = 0
         total_bytes = 0
@@ -1012,6 +1013,8 @@ def _validated_model_keys(base: TensorStore, target: TensorStore, *, include_bia
 def _validate_tensor_pair(name: str, base_tensor: torch.Tensor, target_tensor: torch.Tensor) -> None:
     if base_tensor.shape != target_tensor.shape:
         raise ValueError(f"shape mismatch for {name}: {tuple(base_tensor.shape)} vs {tuple(target_tensor.shape)}")
+    if base_tensor.dtype != target_tensor.dtype:
+        raise ValueError(f"dtype mismatch for {name}: {base_tensor.dtype} vs {target_tensor.dtype}")
 
 
 def _extract_changed_values(
@@ -1027,10 +1030,17 @@ def _extract_changed_values(
     else:
         delta = flat_target - flat_base
         indices = torch.nonzero(delta.abs() > threshold, as_tuple=False).flatten()
-    values = (
-        (flat_target.index_select(0, indices) - flat_base.index_select(0, indices)).contiguous().to(base_tensor.dtype)
-    )
-    return indices, values
+    selected_base = flat_base.index_select(0, indices)
+    selected_target = flat_target.index_select(0, indices)
+    values = selected_target - selected_base
+    if not torch.equal(selected_base + values, selected_target):
+        # Widen only tensors whose additive deltas would otherwise lose target bits.
+        dtype = torch.float32 if base_tensor.dtype in (torch.float16, torch.bfloat16) else torch.float64
+        values = selected_target.to(dtype) - selected_base.to(dtype)
+        reconstructed = (selected_base.to(dtype) + values).to(base_tensor.dtype)
+        if not torch.equal(reconstructed, selected_target):
+            raise ValueError("weight update cannot be represented exactly as an additive sparse delta")
+    return indices, values.contiguous()
 
 
 def _stream_layer_index(name: str) -> int | None:

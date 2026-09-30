@@ -256,6 +256,7 @@ def test_shared_filesystem_delta_weight_broadcast_mode_propagates():
 
 
 def test_inference_relay_config_translates_to_vllm_namespace():
+    assert InferenceConfig().relay.fail_on_peer_error is True
     config = InferenceConfig.model_validate(
         {
             "relay": {
@@ -277,6 +278,28 @@ def test_inference_relay_config_translates_to_vllm_namespace():
     assert namespace.relay_stage_timeout_s == 120.0
     assert namespace.relay_commit_timeout_s == 30.0
     assert namespace.relay_reload_timeout_s == 40.0
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"ckpt": {"resume_step": 3}}, "cannot resume"),
+        ({"ckpt": {"resume_step": -1}}, "cannot resume"),
+        ({"ckpt": {"resume_step": 0}}, "cannot resume"),
+        ({"inference": {"parallel": {"tp": 2}}}, "tp=1"),
+        ({"inference": {"api_server_count": 2}}, "single inference API server"),
+    ],
+)
+def test_delta_rejects_unsynchronized_runtime_configs(overrides, message):
+    config = {
+        "weight_broadcast": {"type": "filesystem", "mode": "delta", "update_protocol": "stage_commit"},
+        "trainer": {},
+        "orchestrator": {"renderer": None},
+        "inference": {},
+    }
+    config.update(overrides)
+    with pytest.raises(ValidationError, match=message):
+        RLConfig.model_validate(config)
 
 
 def test_orchestrator_load_balancing_config_defaults_and_overrides():

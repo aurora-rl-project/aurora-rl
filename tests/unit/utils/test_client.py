@@ -3,6 +3,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
+import pytest
 import verifiers as vf
 
 from prime_rl.configs.shared import ClientConfig
@@ -260,7 +261,8 @@ def test_static_pool_groups_relay_rollout_urls_across_admin_seeds():
             asyncio.run(admin_client.aclose())
 
 
-def test_static_pool_recovers_retired_endpoint_by_replaying_delta(tmp_path):
+@pytest.mark.parametrize("url_suffix", ["", "/"])
+def test_static_pool_recovers_retired_endpoint_by_replaying_delta(tmp_path, url_suffix):
     delta_dir = tmp_path / "step_1"
     delta_dir.mkdir()
     (delta_dir / "delta.safetensors").write_bytes(b"delta")
@@ -279,8 +281,12 @@ def test_static_pool_recovers_retired_endpoint_by_replaying_delta(tmp_path):
 
     async def run() -> None:
         async with (
-            httpx.AsyncClient(transport=httpx.MockTransport(handler("worker-a")), base_url="http://worker-a") as a,
-            httpx.AsyncClient(transport=httpx.MockTransport(handler("worker-b")), base_url="http://worker-b") as b,
+            httpx.AsyncClient(
+                transport=httpx.MockTransport(handler("worker-a")), base_url="http://worker-a" + url_suffix
+            ) as a,
+            httpx.AsyncClient(
+                transport=httpx.MockTransport(handler("worker-b")), base_url="http://worker-b" + url_suffix
+            ) as b,
         ):
             pool = StaticInferencePool(
                 ClientConfig(
@@ -310,16 +316,26 @@ def test_static_pool_recovers_retired_endpoint_by_replaying_delta(tmp_path):
 
             assert pool._endpoint_runtime["http://worker-a"].state == "healthy"
             assert pool._endpoint_runtime["http://worker-b"].state == "retired"
+            pool.quarantine_client(pool._train_clients[1], reason="late rollout failure")
+            assert pool._endpoint_runtime["http://worker-b"].state == "retired"
 
             await pool.commit_weights(version="1", mode="delta")
 
             assert pool._endpoint_runtime["http://worker-a"].state == "healthy"
             assert pool._endpoint_runtime["http://worker-b"].state == "healthy"
 
+            pool.quarantine_client(pool._train_clients[0], reason="server restarted")
+            pool.quarantine_client(pool._train_clients[1], reason="server restarted")
+            assert pool.train_clients == []
+            await asyncio.wait_for(pool.get_eval_client(), timeout=2)
+            assert len(pool.train_clients) == 2
+            assert calls["worker-a"].count("/reload_weights") == 1
+            assert calls["worker-b"].count("/reload_weights") == 2
+
     asyncio.run(run())
 
-    assert calls["worker-a"] == ["/stage", "/pause", "/commit", "/resume"]
-    assert calls["worker-b"] == [
+    assert calls["worker-a"][:4] == ["/stage", "/pause", "/commit", "/resume"]
+    assert calls["worker-b"][:9] == [
         "/stage",
         "/health",
         "/pause",

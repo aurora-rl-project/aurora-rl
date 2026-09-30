@@ -3,10 +3,12 @@ import hashlib
 from urllib.parse import parse_qs
 
 import httpx
+import pytest
 from fastapi import FastAPI
 
+from prime_rl.configs.shared import ClientConfig
 from prime_rl.inference.vllm.server import router
-from prime_rl.utils.client import commit_weights, reload_weights, stage_weights
+from prime_rl.utils.client import StaticInferencePool, commit_weights, reload_weights, stage_weights
 
 
 class FakeEngineClient:
@@ -15,6 +17,7 @@ class FakeEngineClient:
 
     async def collective_rpc(self, method: str, args: tuple = ()) -> None:
         self.calls.append((method, args))
+        await asyncio.sleep(0)
 
     async def pause_generation(self, mode: str = "keep", clear_cache: bool = False) -> None:
         pass
@@ -58,12 +61,14 @@ def test_stage_commit_delta_path_protocol(tmp_path) -> None:
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
             stage_response = await client.post(
                 "/stage",
-                data={"version": "1", "mode": "delta", "path": delta_dir.as_posix()},
+                data={"version": "1", "mode": "delta", "base_version": "0", "path": delta_dir.as_posix()},
             )
             assert stage_response.status_code == 200
 
-            commit_response = await client.post("/commit", data={"version": "1", "mode": "delta"})
-            assert commit_response.status_code == 200
+            responses = await asyncio.gather(
+                *(client.post("/commit", data={"version": "1", "mode": "delta"}) for _ in range(3))
+            )
+            assert all(response.status_code == 200 for response in responses)
 
     asyncio.run(run())
 
@@ -71,27 +76,33 @@ def test_stage_commit_delta_path_protocol(tmp_path) -> None:
     assert app.state.engine_client.calls == [("update_weights_from_delta_path", (delta_dir.as_posix(),))]
 
 
-def test_stage_delta_rejects_base_version_mismatch(tmp_path) -> None:
+@pytest.mark.parametrize("active_version", [None, "1"])
+def test_stage_delta_rejects_base_version_mismatch(tmp_path, active_version) -> None:
     delta_dir = tmp_path / "step_2"
     delta_dir.mkdir()
     (delta_dir / "delta.safetensors").write_bytes(b"placeholder")
     app = make_app(tmp_path)
-    app.state.active_version = "1"
+    app.state.active_version = active_version
+    correct_base = active_version or "0"
 
     async def run() -> None:
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
             mismatch_response = await client.post(
                 "/stage",
-                data={"version": "2", "mode": "delta", "base_version": "0", "path": delta_dir.as_posix()},
+                data={"version": "2", "mode": "delta", "base_version": "wrong", "path": delta_dir.as_posix()},
             )
             assert mismatch_response.status_code == 409
             assert app.state.staged_versions == {}
 
             stage_response = await client.post(
                 "/stage",
-                data={"version": "2", "mode": "delta", "base_version": "1", "path": delta_dir.as_posix()},
+                data={"version": "2", "mode": "delta", "base_version": correct_base, "path": delta_dir.as_posix()},
             )
             assert stage_response.status_code == 200
+            app.state.active_version = "changed-after-staging"
+            commit_response = await client.post("/commit", data={"version": "2", "mode": "delta"})
+            assert commit_response.status_code == 409
+            assert app.state.engine_client.calls == []
 
     asyncio.run(run())
 
@@ -116,6 +127,128 @@ def test_reload_weights_clears_staging_state(tmp_path) -> None:
     assert app.state.staged_versions == {}
     assert not staged_file.exists()
     assert app.state.engine_client.calls == [("reload_weights", ())]
+
+
+def test_failed_commit_requires_reload_before_retry(tmp_path) -> None:
+    app = make_app(tmp_path)
+    delta = tmp_path / "delta.safetensors"
+    delta.write_bytes(b"delta")
+
+    async def fail_update(method, args=()):
+        raise RuntimeError("worker failed during partial application")
+
+    async def run() -> None:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.post(
+                "/stage", data={"version": "1", "mode": "delta", "base_version": "0", "path": str(delta)}
+            )
+            assert response.status_code == 200
+            app.state.engine_client.collective_rpc = fail_update
+            with pytest.raises(RuntimeError, match="partial application"):
+                await client.post("/commit", data={"version": "1"})
+            response = await client.post("/commit", data={"version": "1"})
+            assert response.status_code == 409
+            assert (await client.post("/resume")).status_code == 409
+            app.state.engine_client = FakeEngineClient()
+            assert (await client.post("/reload_weights")).status_code == 200
+            assert not app.state.weights_dirty
+
+    asyncio.run(run())
+
+
+def test_relay_commit_retry_does_not_reapply_seed_delta(tmp_path) -> None:
+    peer = make_app(tmp_path / "peer")
+    attempts = 0
+
+    async def fail_first_commit(request):
+        nonlocal attempts
+        if request.url.path == "/commit":
+            attempts += 1
+            if attempts == 1:
+                return httpx.Response(503)
+        return await httpx.ASGITransport(app=peer).handle_async_request(request)
+
+    seed = make_app(
+        tmp_path / "seed",
+        relay_peers=["http://peer"],
+        relay_transports={"http://peer": httpx.MockTransport(fail_first_commit)},
+        relay_fail_on_peer_error=True,
+    )
+    delta = tmp_path / "delta.safetensors"
+    delta.write_bytes(b"delta")
+
+    async def run() -> None:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=seed), base_url="http://seed") as client:
+            await stage_weights([client], delta, version="1", mode="delta", base_version="0", upload=True)
+            assert (await client.post("/commit", data={"version": "1"})).status_code == 502
+            assert (await client.post("/commit", data={"version": "1"})).status_code == 200
+            assert seed.state.active_version == peer.state.active_version == "1"
+            assert len(seed.state.engine_client.calls) == len(peer.state.engine_client.calls) == 1
+
+    asyncio.run(run())
+
+
+def test_streaming_upload_sessions_do_not_share_files(tmp_path) -> None:
+    app = make_app(tmp_path)
+
+    async def run() -> None:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            uploads = []
+            for _ in range(2):
+                response = await client.post(
+                    "/stage_stream_init",
+                    json={"version": "1", "mode": "delta", "base_version": "0", "filename": "delta.stream"},
+                )
+                assert response.status_code == 200
+                uploads.append(response.json()["upload_id"])
+            for upload_id, content in zip(uploads, [b"first", b"second"]):
+                response = await client.post(
+                    "/stage_stream_chunk", params={"upload_id": upload_id, "offset": 0}, content=content
+                )
+                assert response.status_code == 200
+            for upload_id, content in zip(uploads, [b"first", b"second"]):
+                response = await client.post(
+                    "/stage_stream_finalize",
+                    data={
+                        "upload_id": upload_id,
+                        "final_size": len(content),
+                        "sha256": hashlib.sha256(content).hexdigest(),
+                    },
+                )
+                assert response.status_code == 200
+                assert app.state.staged_versions["1"]["path"].read_bytes() == content
+
+    asyncio.run(run())
+
+
+def test_pool_restages_pending_delta_after_recovery(tmp_path) -> None:
+    app = make_app(tmp_path)
+    delta = tmp_path / "delta.safetensors"
+    delta.write_bytes(b"delta")
+
+    async def run() -> None:
+        pool = StaticInferencePool(
+            ClientConfig(
+                base_url=["http://test/v1"], lease_enabled=True, lease_recovery_enabled=True, lease_cooldown_s=0
+            ),
+            model_name="test-model",
+        )
+        for client in pool.admin_clients:
+            await client.aclose()
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            pool._admin_clients = [client]
+            await pool.stage_weights(delta, version="1", mode="delta", base_version="0", upload=True)
+            pool.quarantine_client(pool.train_clients[0], reason="rollout failed after staging")
+            await pool.recover_unhealthy_endpoints()
+            assert app.state.staged_versions == {}
+            await pool.commit_weights("1", mode="delta")
+            assert app.state.active_version == "1"
+            assert [method for method, _ in app.state.engine_client.calls] == [
+                "reload_weights",
+                "update_weights_from_delta_path",
+            ]
+
+    asyncio.run(run())
 
 
 def test_client_stage_uploads_delta_file(tmp_path) -> None:

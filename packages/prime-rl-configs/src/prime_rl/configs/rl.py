@@ -370,6 +370,29 @@ class RLConfig(BaseConfig):
         return self
 
     @model_validator(mode="after")
+    def validate_sparse_delta_runtime(self):
+        broadcast = self.trainer.weight_broadcast
+        if broadcast.type != "filesystem" or broadcast.mode != "delta":
+            return self
+        if self.trainer.model.lora is not None:
+            raise ValueError("filesystem delta weight updates do not support LoRA.")
+        for config in (self.trainer, self.orchestrator):
+            if config.ckpt and config.ckpt.resume_step is not None:
+                raise ValueError(
+                    "delta weight updates cannot resume without a synchronized full checkpoint; use mode='full'."
+                )
+        if self.inference is not None and self.inference.parallel.tp != 1:
+            raise ValueError("sparse delta weight updates require inference.parallel.tp=1.")
+        if (
+            self.inference is not None
+            and self.orchestrator.weight_broadcast.type == "filesystem"
+            and self.orchestrator.weight_broadcast.update_protocol == "stage_commit"
+            and self.inference.api_server_count != 1
+        ):
+            raise ValueError("stage_commit requires a single inference API server to own the version state.")
+        return self
+
+    @model_validator(mode="after")
     def validate_lease_recovery(self):
         client = self.orchestrator.student.client
         if not client.lease_recovery_enabled:

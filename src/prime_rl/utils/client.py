@@ -182,7 +182,9 @@ class StaticInferencePool:
         self._lease_recovery_enabled = client_config.lease_recovery_enabled
         self._lease_recovery_poll_interval_s = client_config.lease_recovery_poll_interval_s
         self._delta_replay_entries: dict[str, DeltaReplayEntry] = {}
+        self._staged_endpoints: dict[str, set[str]] = {}
         self._active_version: str | None = None
+        self._weight_update_lock = asyncio.Lock()
         self.model_name = model_name
         self._log_grouped_admin_aliases(client_config)
 
@@ -207,6 +209,7 @@ class StaticInferencePool:
                 client = next(self._eval_cycle)
                 if self._client_is_healthy(client):
                     return client
+            await self.recover_unhealthy_endpoints()
             await asyncio.sleep(1)
 
     async def wait_for_ready(self, model_name: str, timeout: int | None = None) -> None:
@@ -239,37 +242,69 @@ class StaticInferencePool:
         upload_method: Literal["multipart", "chunked", "streaming"] = "multipart",
         done_path: Path | None = None,
     ) -> None:
-        await self._record_admin_results(
-            stage_weights(
-                self._healthy_admin_clients("stage_weights"),
-                weight_path,
+        async with self._weight_update_lock:
+            results = await self._record_admin_results(
+                stage_weights(
+                    self._healthy_admin_clients("stage_weights"),
+                    weight_path,
+                    version=version,
+                    mode=mode,
+                    base_version=base_version,
+                    upload=upload,
+                    upload_method=upload_method,
+                    done_path=done_path,
+                ),
+                allow_partial=self._lease_enabled,
+            )
+            self._staged_endpoints[version] = {result.endpoint for result in results if result.ok}
+            self._remember_delta_replay_entry(
+                weight_path=weight_path,
                 version=version,
                 mode=mode,
                 base_version=base_version,
                 upload=upload,
                 upload_method=upload_method,
                 done_path=done_path,
-            ),
-            allow_partial=self._lease_enabled,
-        )
-        self._remember_delta_replay_entry(
-            weight_path=weight_path,
-            version=version,
-            mode=mode,
-            base_version=base_version,
-            upload=upload,
-            upload_method=upload_method,
-            done_path=done_path,
-        )
+            )
 
     async def commit_weights(self, version: str, mode: str | None = None) -> None:
-        await self._record_admin_results(
-            commit_weights(self._healthy_admin_clients("commit_weights"), version=version, mode=mode),
-            allow_partial=self._lease_enabled,
-        )
-        self._active_version = version
-        if mode == "delta" and self._lease_recovery_enabled:
-            await self.recover_unhealthy_endpoints()
+        async with self._weight_update_lock:
+            entry = self._delta_replay_entries.get(version)
+            if entry is not None:
+                missing_stage = [
+                    client
+                    for client in self._healthy_admin_clients("commit_weights")
+                    if self._endpoint_key(client) not in self._staged_endpoints.get(version, set())
+                ]
+                if missing_stage:
+                    try:
+                        results = await self._record_admin_results(
+                            stage_weights(
+                                missing_stage,
+                                entry.weight_path,
+                                version=entry.version,
+                                mode="delta",
+                                base_version=entry.base_version,
+                                upload=entry.upload,
+                                upload_method=entry.upload_method,
+                                done_path=entry.done_path,
+                            ),
+                            allow_partial=self._lease_enabled,
+                        )
+                    except EndpointOperationError:
+                        if not self._lease_enabled or not self.train_clients:
+                            raise
+                    else:
+                        self._staged_endpoints.setdefault(version, set()).update(
+                            result.endpoint for result in results if result.ok
+                        )
+            await self._record_admin_results(
+                commit_weights(self._healthy_admin_clients("commit_weights"), version=version, mode=mode),
+                allow_partial=self._lease_enabled,
+            )
+            self._active_version = version
+            if mode == "delta" and self._lease_recovery_enabled:
+                await self._recover_unhealthy_endpoints()
 
     async def reload_weights(self) -> None:
         await self._record_admin_results(
@@ -283,6 +318,8 @@ class StaticInferencePool:
             return
         endpoint = self._client_endpoint_key(client_config)
         if endpoint not in self._endpoint_runtime:
+            return
+        if self._endpoint_runtime[endpoint].state != "healthy":
             return
         self._set_endpoint_state(endpoint, "quarantine", reason=reason)
 
@@ -474,9 +511,12 @@ class StaticInferencePool:
         )
 
     async def recover_unhealthy_endpoints(self) -> None:
-        if not self._lease_recovery_enabled or self._active_version is None:
+        if not self._lease_recovery_enabled:
             return
+        async with self._weight_update_lock:
+            await self._recover_unhealthy_endpoints()
 
+    async def _recover_unhealthy_endpoints(self) -> None:
         now = time.monotonic()
         for admin_client in self._admin_clients:
             endpoint = self._endpoint_key(admin_client)
@@ -486,10 +526,6 @@ class StaticInferencePool:
             if runtime.quarantine_until is not None and now < runtime.quarantine_until:
                 continue
             if not await self._endpoint_health_check(admin_client):
-                continue
-
-            if runtime.state == "quarantine":
-                self._set_endpoint_state(endpoint, "healthy", reason="health check succeeded after quarantine")
                 continue
 
             await self._recover_retired_endpoint(admin_client)
@@ -506,6 +542,8 @@ class StaticInferencePool:
     async def _recover_retired_endpoint(self, admin_client: AsyncClient) -> None:
         endpoint = self._endpoint_key(admin_client)
         self._set_endpoint_state(endpoint, "recovering", reason="starting delta replay recovery")
+        for endpoints in self._staged_endpoints.values():
+            endpoints.discard(endpoint)
         try:
             await self._record_admin_results(reload_weights([admin_client]))
             for entry in self._delta_replay_plan():
@@ -523,6 +561,7 @@ class StaticInferencePool:
                     )
                 )
                 await self._record_admin_results(commit_weights([admin_client], version=entry.version, mode="delta"))
+                self._staged_endpoints.setdefault(entry.version, set()).add(endpoint)
         except Exception as exc:
             self._set_endpoint_state(endpoint, "retired", reason=f"delta replay recovery failed: {exc}")
             return
@@ -666,14 +705,14 @@ def setup_admin_clients(client_config: ClientConfig) -> list[AsyncClient]:
             base_url=base_url,
             headers=headers,
             limits=httpx.Limits(max_connections=4, max_keepalive_connections=1),
-            timeout=httpx.Timeout(None),
+            timeout=httpx.Timeout(client_config.timeout, connect=client_config.connect_timeout),
         )
 
     return [_setup_admin_client(base_url) for base_url in urls]
 
 
 def _endpoint_key(admin_client: AsyncClient) -> str:
-    return str(admin_client.base_url)
+    return str(admin_client.base_url).rstrip("/").removesuffix("/v1")
 
 
 def _format_exception(exception: BaseException) -> str:

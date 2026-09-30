@@ -67,6 +67,10 @@ def _ensure_weight_staging_state(state: State) -> None:
         state.stage_uploads = {}
     if not hasattr(state, "active_version"):
         state.active_version = None
+    if not hasattr(state, "weight_update_lock"):
+        state.weight_update_lock = asyncio.Lock()
+    if not hasattr(state, "weights_dirty"):
+        state.weights_dirty = False
     if not hasattr(state, "staging_dir"):
         state.staging_dir = Path("staging")
     state.staging_dir.mkdir(parents=True, exist_ok=True)
@@ -147,7 +151,7 @@ async def _relay_post(
 
 
 def _relay_failure_response(state: State, operation: str, stats: dict[str, float | None]) -> JSONResponse | None:
-    if not bool(getattr(state, "relay_fail_on_peer_error", False)):
+    if not bool(getattr(state, "relay_fail_on_peer_error", True)):
         return None
     failed_peers = [peer for peer, duration in stats.items() if duration is None]
     if not failed_peers:
@@ -524,6 +528,19 @@ def _cleanup_stage_upload(state: State, upload: dict[str, Any]) -> None:
         path.unlink()
 
 
+async def _register_staged_version(state: State, version: str, entry: dict[str, Any]) -> JSONResponse | None:
+    async with state.weight_update_lock:
+        metadata = _validate_stage_metadata(state, {**entry, "version": version})
+        if isinstance(metadata, JSONResponse):
+            _cleanup_staged_file(state, entry)
+            return metadata
+        previous = state.staged_versions.get(version)
+        if previous is not None and previous["path"] != entry["path"]:
+            _cleanup_staged_file(state, previous)
+        state.staged_versions[version] = entry
+    return None
+
+
 def _stage_upload_key(version: str, mode: str) -> str:
     return f"{version}:{mode}"
 
@@ -549,12 +566,24 @@ def _validate_stage_metadata(state: State, fields: dict[str, Any]) -> tuple[str,
     version = str(fields.get("version", "unknown"))
     mode = str(fields.get("mode", "full"))
     base_version = fields.get("base_version")
+    if base_version is not None:
+        base_version = str(base_version)
     active_version = state.active_version
 
     if mode not in WEIGHT_UPDATE_MODES:
         return _error_response(400, f"unsupported weight update mode: {mode}")
-    if mode == "delta" and base_version and active_version and base_version != active_version:
-        return _error_response(409, f"base_version mismatch: current={active_version}, got={base_version}")
+    if getattr(state, "api_server_count", 1) != 1:
+        return _error_response(400, "stage_commit requires a single API server to own the version state")
+    if mode == "delta":
+        if state.weights_dirty:
+            return _error_response(409, "weights require reload after a failed update")
+        current_version = active_version or "0"
+        if base_version is None:
+            return _error_response(400, "base_version is required for delta updates")
+        if base_version != current_version:
+            return _error_response(409, f"base_version mismatch: current={current_version}, got={base_version}")
+        if version == base_version:
+            return _error_response(409, "delta version must differ from base_version")
 
     return version, mode, base_version, active_version
 
@@ -607,6 +636,9 @@ async def pause(request: Request):
 
 @router.post("/resume")
 async def resume(request: Request):
+    _ensure_weight_staging_state(request.app.state)
+    if request.app.state.weights_dirty:
+        return _error_response(409, "weights require reload after a failed update")
     await engine_client(request).resume_generation()
     return {"status": "resumed"}
 
@@ -640,7 +672,7 @@ async def stage_weights(request: Request):
     suffix = "delta" if mode == "delta" else "full"
     if uploaded_file is not None:
         filename = _safe_path_component(Path(uploaded_file.filename or "weights").name)
-        staged_path = request.app.state.staging_dir / f"{_safe_path_component(version)}_{suffix}_{filename}"
+        staged_path = request.app.state.staging_dir / f"{uuid4().hex}_{suffix}_{filename}"
         with staged_path.open("wb") as f:
             while chunk := await uploaded_file.read(STAGE_READ_CHUNK_BYTES):
                 f.write(chunk)
@@ -654,7 +686,13 @@ async def stage_weights(request: Request):
             return _error_response(404, f"staged path does not exist: {staged_path}")
         owned = False
 
-    request.app.state.staged_versions[version] = {"path": staged_path, "mode": mode, "owned": owned}
+    error = await _register_staged_version(
+        request.app.state,
+        version,
+        {"path": staged_path, "mode": mode, "base_version": base_version, "owned": owned},
+    )
+    if error is not None:
+        return error
     ingest_ms = (time.perf_counter() - ingest_start) * 1000
     logger.info(
         "Staged %s weights version %s from %s (base_version=%s active_version=%s owned=%s ingest_ms=%.2f)",
@@ -709,8 +747,8 @@ async def stage_stream_init(request: Request):
 
     upload_id = uuid4().hex
     suffix = "delta" if mode == "delta" else "full"
-    temp_path = request.app.state.staging_dir / f"{_safe_path_component(version)}_{suffix}_{filename}.stream.part"
-    staged_path = request.app.state.staging_dir / f"{_safe_path_component(version)}_{suffix}_{filename}"
+    temp_path = request.app.state.staging_dir / f"{upload_id}_{suffix}_{filename}.stream.part"
+    staged_path = request.app.state.staging_dir / f"{upload_id}_{suffix}_{filename}"
     temp_path.parent.mkdir(parents=True, exist_ok=True)
     with temp_path.open("wb"):
         pass
@@ -818,11 +856,9 @@ async def stage_stream_finalize(request: Request):
     if upload is None:
         return _error_response(404, f"streaming upload {upload_id} not found")
 
-    if upload["mode"] == "delta":
-        base_version = upload["base_version"]
-        active_version = request.app.state.active_version
-        if base_version and active_version and base_version != active_version:
-            return _error_response(409, f"base_version mismatch: current={active_version}, got={base_version}")
+    metadata = _validate_stage_metadata(request.app.state, upload)
+    if isinstance(metadata, JSONResponse):
+        return metadata
 
     ranges = upload["ranges"]
     if not _upload_complete(ranges, final_size):
@@ -850,8 +886,14 @@ async def stage_stream_finalize(request: Request):
     temp_path.replace(staged_path)
 
     version = str(upload["version"])
-    request.app.state.staged_versions[version] = {"path": staged_path, "mode": upload["mode"], "owned": True}
     request.app.state.stage_uploads.pop(upload_key, None)
+    error = await _register_staged_version(
+        request.app.state,
+        version,
+        {"path": staged_path, "mode": upload["mode"], "base_version": upload["base_version"], "owned": True},
+    )
+    if error is not None:
+        return error
     ingest_ms = (time.perf_counter() - upload["start_time"]) * 1000
     logger.info(
         "Staged %s weights version %s from %s via streaming upload "
@@ -1010,13 +1052,19 @@ async def stage_finalize(request: Request):
         return _error_response(409, f"sha256 mismatch: expected={expected_sha256}, got={actual_sha256}")
 
     suffix = "delta" if mode == "delta" else "full"
-    staged_path = request.app.state.staging_dir / f"{_safe_path_component(version)}_{suffix}_{filename}"
+    staged_path = request.app.state.staging_dir / f"{uuid4().hex}_{suffix}_{filename}"
     if staged_path.exists():
         staged_path.unlink()
     temp_path.replace(staged_path)
 
-    request.app.state.staged_versions[version] = {"path": staged_path, "mode": mode, "owned": True}
     request.app.state.stage_uploads.pop(key, None)
+    error = await _register_staged_version(
+        request.app.state,
+        version,
+        {"path": staged_path, "mode": mode, "base_version": base_version, "owned": True},
+    )
+    if error is not None:
+        return error
     ingest_ms = (time.perf_counter() - upload["start_time"]) * 1000
     logger.info(
         "Staged %s weights version %s from %s via chunked upload "
@@ -1051,6 +1099,11 @@ async def stage_finalize(request: Request):
 async def commit_weights(request: Request):
     """Commit a staged full checkpoint or sparse delta."""
     _ensure_weight_staging_state(request.app.state)
+    async with request.app.state.weight_update_lock:
+        return await _commit_weights(request)
+
+
+async def _commit_weights(request: Request):
     fields, _ = await _read_request_fields(request)
     relay_requested = _relay_requested(fields)
     version = fields.get("version")
@@ -1069,14 +1122,18 @@ async def commit_weights(request: Request):
         return _error_response(409, f"staged mode mismatch: staged={mode}, requested={requested_mode}")
 
     path = Path(entry["path"])
-    if mode == "full":
-        await engine_client(request).collective_rpc("update_weights_from_path", args=(path.as_posix(),))
-    elif mode == "delta":
-        await engine_client(request).collective_rpc("update_weights_from_delta_path", args=(path.as_posix(),))
-    else:
-        return _error_response(400, f"unsupported weight update mode: {mode}")
-
-    request.app.state.active_version = version
+    state = request.app.state
+    if state.weights_dirty:
+        return _error_response(409, "weights require reload after a failed update")
+    if state.active_version != version:
+        metadata = _validate_stage_metadata(state, {**entry, "version": version})
+        if isinstance(metadata, JSONResponse):
+            return metadata
+        state.weights_dirty = True
+        method = "update_weights_from_delta_path" if mode == "delta" else "update_weights_from_path"
+        await engine_client(request).collective_rpc(method, args=(path.as_posix(),))
+        state.active_version = version
+        state.weights_dirty = False
     for staged_version, old_entry in list(staged_versions.items()):
         if staged_version == version:
             continue
@@ -1103,14 +1160,21 @@ async def commit_weights(request: Request):
 async def reload_weights(request: Request):
     """Reload the base model weights and clear local staging state."""
     _ensure_weight_staging_state(request.app.state)
+    async with request.app.state.weight_update_lock:
+        return await _reload_weights(request)
+
+
+async def _reload_weights(request: Request):
     fields, _ = await _read_request_fields(request)
     relay_requested = _relay_requested(fields)
+    request.app.state.weights_dirty = True
     await engine_client(request).collective_rpc("reload_weights")
     for entry in list(request.app.state.staged_versions.values()):
         _cleanup_staged_file(request.app.state, entry)
     for upload in list(request.app.state.stage_uploads.values()):
         _cleanup_stage_upload(request.app.state, upload)
     request.app.state.active_version = None
+    request.app.state.weights_dirty = False
     request.app.state.staged_versions.clear()
     request.app.state.stage_uploads.clear()
     fanout_start = time.perf_counter()
@@ -1184,10 +1248,11 @@ async def custom_init_app_state(
     state.staged_versions = {}
     state.stage_uploads = {}
     state.active_version = None
+    state.api_server_count = getattr(args, "api_server_count", 1)
     state.staging_dir.mkdir(parents=True, exist_ok=True)
     state.relay_enabled = bool(getattr(args, "relay_enabled", False))
     state.relay_peers = list(getattr(args, "relay_peers", []) or [])
-    state.relay_fail_on_peer_error = bool(getattr(args, "relay_fail_on_peer_error", False))
+    state.relay_fail_on_peer_error = bool(getattr(args, "relay_fail_on_peer_error", True))
     state.relay_stage_timeout_s = float(getattr(args, "relay_stage_timeout_s", 3600.0))
     state.relay_commit_timeout_s = float(getattr(args, "relay_commit_timeout_s", 600.0))
     state.relay_reload_timeout_s = float(getattr(args, "relay_reload_timeout_s", 600.0))

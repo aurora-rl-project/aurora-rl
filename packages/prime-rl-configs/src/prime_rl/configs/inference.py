@@ -96,7 +96,7 @@ class RelayConfig(BaseConfig):
     peers: list[str] = []
     """Peer inference admin base URLs for this relay seed. Use one relay seed per region, with region-local peers here."""
 
-    fail_on_peer_error: bool = False
+    fail_on_peer_error: bool = True
     """When true, relay endpoints return an error if any peer fan-out request fails."""
 
     stage_timeout_s: float = Field(3600.0, gt=0)

@@ -86,6 +86,14 @@ delta_stream_group_size = 4
 
 When configuring the trainer entrypoint directly instead of using the shared RL config, set `weight_broadcast.delta_streaming_enabled = true` explicitly. Non-streaming extraction writes `delta.safetensors`; streaming extraction writes `delta.stream`.
 
+Sparse updates include changed biases. Delta values normally retain the weight dtype, but tensors with subtraction/addition rounding loss use wider values to reproduce the target weights exactly. This does not change trainer optimization or reduction dtypes. Deploy the updated delta writer and inference loader together; older loaders downcast wider values before application. The verification script includes biases by default; use `--no-include-bias` only for older artifacts that intentionally omitted them.
+
+Delta inference requires unquantized, unsharded parameters: TP=1, PP=1, and no expert parallelism. Stage/commit also requires one API server per inference endpoint, because its version and upload state live in that process. Use independent endpoints for replica scaling. LoRA and checkpoint resume without a synchronized full base are unsupported in delta mode; use full weight broadcasts when resuming.
+
+Every staged delta must specify `base_version`, including `"0"` for a freshly loaded base model. Commit checks the base again and serializes weight changes. Repeating a committed version retries relay fan-out without applying the local delta twice. After a worker fails during application, reload the base and replay the retained chain before serving that endpoint again; retrying the failed delta alone is unsafe.
+
+Keep `relay.fail_on_peer_error = true` (the default) when relay peers serve rollouts. A peer failure must fail the seed operation so the pool can retire the entire region until replay succeeds. Admin requests use the client `timeout` and `connect_timeout`; configure these to allow expected WAN transfer times while bounding failed requests. Lease recovery also runs when no rollout or evaluation endpoints are healthy, so an entirely quarantined pool can recover without waiting for another commit.
+
 ## Key files
 
 - `packages/prime-rl-configs/src/prime_rl/` — config classes under `configs/`; `utils/config.py` re-exports `BaseConfig` and `cli`

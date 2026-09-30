@@ -51,17 +51,13 @@ class FileSystemWeightBroadcast(WeightBroadcast):
     def initialize(self, model: nn.Module, step: int = 0) -> None:
         if self.mode != "delta":
             return
+        if step != 0:
+            raise ValueError("delta broadcast cannot resume without a synchronized full checkpoint; use mode='full'")
 
         state_dict = self._gather_hf_state(model)
         self._initial_state = state_dict
         for idx in self.multi_run_manager.used_idxs:
             self._prev_state_by_run[idx] = state_dict
-
-            if step != 0:
-                self.logger.warning(
-                    f"Delta filesystem broadcast initialized at step {step}; using current weights as the delta base"
-                )
-                continue
 
             if self.world.is_master:
                 save_dir = get_step_path(get_broadcast_dir(self.multi_run_manager.get_run_dir(idx)), 0)
